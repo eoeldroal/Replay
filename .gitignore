@@ -1,0 +1,119 @@
+# === 1. AI Models & Large Weights ===
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.h5
+**/checkpoints/
+**/outputs/
+
+# === 2. Data & Logs (Project Specific) ===
+/data/
+/agent_crops/
+/search_engine/corpus/
+
+# **/logs/
+# **/wandb/
+*.jsonl
+*.parquet
+*.tar.gz
+wget-log
+output.txt
+# === 3. Python & Environment ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+venv/
+.venv/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+build/
+dist/
+*.egg-info/
+
+# === 4. IDE & System Cache ===
+.vscode/
+.vscode-server/
+.idea/
+.history/
+.ipynb_checkpoints/
+.DS_Store
+*.swp
+
+# === 5. Server/Compute Specific (Triton, GPU) ===
+.triton/
+.cache/
+*.cubin
+*.ptx
+.bash_history
+
+# === 6. Project Specific Trash ===
+**/playground/
+.dotnet/
+
+# === 6b. Local Large Assets / Notes (Keep Out Of Git) ===
+tmp/
+*.whl
+.claude/
+*.code-workspace
+# Local LNS corpus images are large and machine-specific; keep configs/docs under LNS/ tracked.
+LNS/corpus/
+# === 7. User Specific & Security (Recommended) ===
+.local/             # 사용자 로컬 라이브러리 및 바이너리 (매우 중요)
+.gitconfig          # 개인 Git 설정 파일
+.gnupg/             # GPG 보안 키 관련 폴더
+.bash_history       # 터미널 명령어 기록
+.bashrc             # 개인 쉘 설정
+.profile            # 시스템 프로필
+
+# === 8. Research Specific (Optional) ===
+# VLM이나 RAG 작업 시 생성되는 임시 캐시가 있다면 추가하세요
+.nv/                # NVIDIA 캐시 폴더
+.triton/            # Triton 컴파일 캐시 (기존에 있었으나 재확인)
+.ssh/
+# local dataset artifacts (keep repository code clean)
+data/**
+
+# --- Exceptions: keep lightweight filter artifacts tracked ---
+# We intentionally keep most of `data/` out of git, but the filtering outputs
+# (stats, removed id lists, rewrite logs) are useful for reproducibility.
+!data/
+!data/VDR_processed_filtered_2/
+!data/VDR_processed_filtered_2/filters/
+!data/VDR_processed_filtered_2/filters/**
+!data/VDR_processed_filtered_2/filters/**/*.jsonl
+
+# GitHub hard limit: files > 100MB cannot be pushed.
+data/VDR_processed_filtered_2/filters/gti_validation/VDR_ibm.jsonl
+data/VDR_processed_filtered_2/filters/doc_independent_qwen235b_logs/VDR_ibm_20260122_073506.jsonl
+
+# upload safety
+checkpoints/
+logs/
+logs_deprecated/
+wandb/
+outputs/
+data-log/
+node_modules/
+data/models/
+data/**
+
+# keep small configs/docs only if needed
+!data/VDR_processed_filtered_2/
+!data/VDR_processed_filtered_2/filters/
+!data/VDR_processed_filtered_2/filters/**
+
+nohup.out
+*.pre_restore_backup
+
+nohup.out
+*.pre_restore_backup
