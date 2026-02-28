@@ -386,6 +386,7 @@ class RayPPOTrainer:
         self.m2_replay_full_scores_dir: Optional[str] = None
         self.m2_replay_training_mode = "legacy_bonus"
         self.m2_replay_fixed_total_groups = 0
+        self.m2_replay_fixed_total_floor_groups = 0
         self.m2_replay_adv_zero_eps = 1e-8
         self.m2_replay_buffer: Optional[QueryGroupReplayBuffer] = None
         self.m2_replay_query_use_count: dict[str, int] = defaultdict(int)
@@ -437,6 +438,15 @@ class RayPPOTrainer:
             self.m2_replay_fixed_total_groups = int(fixed_total_cfg or 0)
             if self.m2_replay_fixed_total_groups <= 0:
                 self.m2_replay_fixed_total_groups = int(self.config.data.get("train_batch_size", 0) or 0)
+            fixed_total_floor_cfg = schedule_cfg.get("fixed_total_floor_groups", 0)
+            self.m2_replay_fixed_total_floor_groups = int(fixed_total_floor_cfg or 0)
+            if self.m2_replay_fixed_total_floor_groups < 0:
+                print(
+                    "[m2_replay] Warning: schedule.fixed_total_floor_groups must be >= 0. "
+                    "Disabling floor behavior.",
+                    flush=True,
+                )
+                self.m2_replay_fixed_total_floor_groups = 0
             self.m2_replay_prefix = str(logging_cfg.get("prefix", "m2_replay"))
             self.m2_replay_dump_full_scores = bool(logging_cfg.get("dump_full_scores", True))
             custom_full_scores_dir = logging_cfg.get("full_scores_dir", None)
@@ -1599,6 +1609,7 @@ class RayPPOTrainer:
         onpolicy_adv0_groups = []
         fallback_adv0_groups = []
         fixed_total_groups = int(self.m2_replay_fixed_total_groups)
+        fixed_total_floor_groups = int(self.m2_replay_fixed_total_floor_groups)
         if fixed_total_groups <= 0:
             fixed_total_groups = int(self.config.data.get("train_batch_size", onpolicy_train_group_count) or 0)
         if fixed_total_groups <= 0:
@@ -1616,6 +1627,14 @@ class RayPPOTrainer:
                 onpolicy_all_groups,
                 eps=self.m2_replay_adv_zero_eps,
             )
+            if fixed_total_floor_groups >= fixed_total_groups:
+                if fixed_total_floor_groups > fixed_total_groups:
+                    print(
+                        "[m2_replay] Warning: schedule.fixed_total_floor_groups must be < "
+                        f"schedule.fixed_total_groups ({fixed_total_groups}). Disabling floor behavior.",
+                        flush=True,
+                    )
+                fixed_total_floor_groups = 0
             if len(onpolicy_nonzero_groups) > fixed_total_groups:
                 onpolicy_nonzero_groups = onpolicy_nonzero_groups[:fixed_total_groups]
             replay_target_groups = max(fixed_total_groups - len(onpolicy_nonzero_groups), 0)
@@ -1623,6 +1642,7 @@ class RayPPOTrainer:
             metrics[self._m2_key("selection/onpolicy_adv0_groups")] = float(len(onpolicy_adv0_groups))
             metrics[self._m2_key("selection/replay_need")] = float(replay_target_groups)
             metrics[self._m2_key("selection/fixed_total_groups")] = float(fixed_total_groups)
+            metrics[self._m2_key("selection/fixed_total_floor_groups")] = float(fixed_total_floor_groups)
         else:
             replay_target_groups = (
                 int(self.m2_replay_replay_target_groups)
@@ -1670,23 +1690,38 @@ class RayPPOTrainer:
                 used_groups = (used_groups // micro_groups) * micro_groups
 
         replay_groups = replay_groups[:used_groups]
+        applied_total_groups = fixed_total_groups
+        replay_trimmed_for_floor = 0
+        if self.m2_replay_training_mode == "fixed_total_with_adv0_drop" and fixed_total_floor_groups > 0:
+            # If preferred total is not reachable, snap down to floor total
+            # and trim replay to avoid ragged 257~(preferred-1) group counts.
+            available_nonzero_with_replay = len(onpolicy_nonzero_groups) + len(replay_groups)
+            if available_nonzero_with_replay < fixed_total_groups:
+                applied_total_groups = fixed_total_floor_groups
+                max_replay_for_floor = max(applied_total_groups - len(onpolicy_nonzero_groups), 0)
+                if len(replay_groups) > max_replay_for_floor:
+                    replay_trimmed_for_floor = len(replay_groups) - max_replay_for_floor
+                    replay_groups = replay_groups[:max_replay_for_floor]
+
         for group in replay_groups:
             group.last_training_step = int(self.global_steps)
         metrics[self._m2_key("pass2/selected_groups")] = float(selected_groups)
         metrics[self._m2_key("pass2/used_groups")] = float(len(replay_groups))
         metrics[self._m2_key("selection/replay_used")] = float(len(replay_groups))
+        metrics[self._m2_key("selection/replay_trimmed_for_floor")] = float(replay_trimmed_for_floor)
+        metrics[self._m2_key("selection/fixed_total_target_applied")] = float(applied_total_groups)
 
         if self.m2_replay_training_mode == "fixed_total_with_adv0_drop":
-            fallback_needed = max(fixed_total_groups - len(onpolicy_nonzero_groups) - len(replay_groups), 0)
+            fallback_needed = max(applied_total_groups - len(onpolicy_nonzero_groups) - len(replay_groups), 0)
             fallback_adv0_groups = onpolicy_adv0_groups[:fallback_needed]
             onpolicy_actor_groups = onpolicy_nonzero_groups + fallback_adv0_groups
             final_train_groups = len(onpolicy_actor_groups) + len(replay_groups)
             metrics[self._m2_key("selection/fallback_adv0_used")] = float(len(fallback_adv0_groups))
             metrics[self._m2_key("selection/final_train_groups")] = float(final_train_groups)
-            if final_train_groups < fixed_total_groups:
+            if final_train_groups < applied_total_groups:
                 print(
                     "[m2_replay] Warning: fixed-total mode underfilled actor batch "
-                    f"(target={fixed_total_groups}, actual={final_train_groups}).",
+                    f"(target={applied_total_groups}, actual={final_train_groups}).",
                     flush=True,
                 )
         else:
@@ -1736,6 +1771,9 @@ class RayPPOTrainer:
             used_groups=len(replay_groups),
             extra_payload={
                 "fixed_total_groups": int(fixed_total_groups),
+                "fixed_total_floor_groups": int(fixed_total_floor_groups),
+                "fixed_total_target_applied": int(applied_total_groups),
+                "replay_trimmed_for_floor": int(replay_trimmed_for_floor),
                 "onpolicy_nonzero_query_ids": [group.query_id for group in onpolicy_nonzero_groups],
                 "onpolicy_adv0_query_ids": [group.query_id for group in onpolicy_adv0_groups],
                 "fallback_adv0_query_ids": [group.query_id for group in fallback_adv0_groups],
@@ -1751,6 +1789,8 @@ class RayPPOTrainer:
             f"replay_target={replay_target_groups} "
             f"replay_selected={selected_groups} "
             f"replay_used={len(replay_query_ids)} "
+            f"fixed_total_target_applied={applied_total_groups} "
+            f"replay_trimmed_for_floor={replay_trimmed_for_floor} "
             f"onpolicy_nonzero={len(onpolicy_nonzero_groups)} "
             f"onpolicy_adv0={len(onpolicy_adv0_groups)} "
             f"fallback_adv0_used={len(fallback_adv0_groups)} "
