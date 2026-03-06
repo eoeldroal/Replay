@@ -5,8 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 project_name=m2-replay-exp
-experiment_name=grpo-qwen3-1.7b-s8-m2-replay-rev8-tau001-b1024-ndeg-advmag
-one_turnover_gate=true
+experiment_name=grpo-qwen3-1.7b-s8-m2-replay-rev8-tau0015-b1024-ndeg-advmag-bufferfull
+start_mode=buffer_full
 
 deepscaler_preview_train_path="$ROOT_DIR/data/deepscaler_preview/train.parquet"
 train_files="['$deepscaler_preview_train_path']"
@@ -68,10 +68,10 @@ python3 -u -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
     algorithm.use_kl_in_reward=False \
     +algorithm.m2_replay.enable=true \
-    +algorithm.m2_replay.tau=0.001 \
+    +algorithm.m2_replay.tau=0.0015 \
     +algorithm.m2_replay.buffer.max_query_groups=1024 \
     +algorithm.m2_replay.schedule.replay_target_groups=128 \
-    +algorithm.m2_replay.schedule.one_turnover_gate=${one_turnover_gate} \
+    +algorithm.m2_replay.schedule.start_mode=${start_mode} \
     +algorithm.m2_replay.selection.mode=zvp_recency \
     +algorithm.m2_replay.selection.zvp_use_recency=false \
     +algorithm.m2_replay.selection.zvp_ema_alpha=1.0 \

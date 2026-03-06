@@ -21,6 +21,7 @@ import torch
 
 import verl.trainer.ppo.core_algos
 from verl.trainer.ppo.core_algos import (
+    compute_policy_loss_vanilla,
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
@@ -29,6 +30,7 @@ from verl.trainer.ppo.core_algos import (
     get_adv_estimator_fn,
     register_adv_est,
 )
+from verl.workers.config.actor import ActorConfig
 
 
 def mock_test_fn():
@@ -257,6 +259,39 @@ def test_rloo_and_vectorized_equivalence(batch_size: int, seq_len: int, num_grou
     assert ret1.shape == ret2.shape == (batch_size, seq_len)
     assert torch.allclose(adv1, adv2, rtol=1e-5, atol=1e-6)
     assert torch.allclose(ret1, ret2, rtol=1e-5, atol=1e-6)
+
+
+def test_policy_loss_vanilla_reports_replay_split_metrics():
+    config = ActorConfig(
+        strategy="fsdp",
+        rollout_n=1,
+        ppo_micro_batch_size=2,
+        clip_ratio=0.2,
+    )
+
+    old_log_prob = torch.zeros(2, 2)
+    log_prob = torch.log(torch.tensor([[1.5, 1.0], [1.0, 1.0]], dtype=torch.float32))
+    advantages = torch.ones(2, 2)
+    response_mask = torch.ones(2, 2)
+    source_ids = torch.tensor([True, False], dtype=torch.bool)
+
+    _, metrics = compute_policy_loss_vanilla(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        config=config,
+        source_ids=source_ids,
+    )
+
+    assert metrics["actor/replay_seq_frac"] == pytest.approx(0.5)
+    assert metrics["actor/replay_token_frac"] == pytest.approx(0.5)
+    assert metrics["actor/replay_pg_clipfrac"] == pytest.approx(0.5)
+    assert metrics["actor/onpolicy_pg_clipfrac"] == pytest.approx(0.0)
+    assert metrics["actor/replay_pg_clipfrac_lower"] == pytest.approx(0.0)
+    assert metrics["actor/onpolicy_pg_clipfrac_lower"] == pytest.approx(0.0)
+    assert metrics["actor/replay_ppo_kl"] == pytest.approx(float((-log_prob[0]).mean().item()))
+    assert metrics["actor/onpolicy_ppo_kl"] == pytest.approx(0.0)
 
 
 @pytest.mark.parametrize(

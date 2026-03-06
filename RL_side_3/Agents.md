@@ -15,11 +15,142 @@
 ## 현재 상태 요약
 
 - **Stable SSOT**: `rev2` 기준 `recency_only + rlvr_halfband + tau=0.001 + replay_target=128 + buffer=1024`
-- **Active Frontier**: `rev5~rev7` 기준 `zvp_recency + batched M2 eval + one_turnover_gate + Qwen3`
+- **Active Frontier**: `rev5~rev8` 기준 `zvp_recency + batched M2 eval + one_turnover_gate + Qwen3`
 - **문서 해석 원칙**:
   - `FACTS_AND_DECISIONS.md`는 안정 축 기준
   - `Revising_6.md`, `Revising_8.md`는 확장 축 기준
+  - `Revising_9.md`는 Qwen3 failure diagnosis + rev8 방향 + split logging 반영본
   - 아래 성능 표는 주로 Qwen2.5-Math-1.5B 축 기록이며, Qwen3 축과 직접 혼용하지 않음
+
+## 2026-03-06 최신 운용 메모
+
+### 지금 실제로 중요한 실행 스크립트
+
+- Qwen3 baseline: `RL_side_3/grpo-qwen3-1.7b-s8.sh`
+- Qwen3 replay frontier:
+  - `RL_side_3/grpo-qwen3-1.7b-s8-m2-replay-rev7.sh`
+  - `RL_side_3/grpo-qwen3-1.7b-s8-m2-replay-rev8.sh`
+- Qwen2.5-Math replay 비교 기준:
+  - `RL_side_3/grpo-qwen25-math-1.5b-s8-m2-replay-rev2.sh`
+  - `RL_side_3/grpo-qwen25-math-1.5b-s8-m2-replay-rev5.sh`
+
+### Qwen3에서 현재 가장 중요한 진단
+
+- `rev7`의 핵심 문제는 "replay가 조금 약하다"가 아니라, `replay_used=0`에 가까운 deadlock이다
+- direct cause는 top-ranked replay candidate가 stale해서 `tau=0.001` M2 gate를 통과하지 못하는 것이다
+- 이 문제는 `tau` 숫자 하나보다 아래 조합에서 발생한다
+  - thinner halfband ingress
+  - no replay refresh
+  - long / clipped trajectory
+  - sign-only ZVP의 `1/16` hard-negative 과선호
+
+### Qwen2.5-Math와 Qwen3의 가장 중요한 차이
+
+- Qwen2.5-Math에서는 top-ZVP hard negative가 **fresh**하다
+- Qwen3 rev7에서는 top-ZVP hard negative가 **stale**하다
+- 요약:
+  - Qwen2.5-Math: `fresh, short, tau-safe hard negative`
+  - Qwen3 rev7: `stale, long, clipped, tau-unsafe hard negative`
+
+### `age` 해석
+
+- `age`는 단순 "버퍼에 들어온 지 몇 step"이 아니라 `current_step - last_training_step`이다
+- replay가 실제로 사용되면 `last_training_step`가 refresh된다
+- 따라서 replay가 한 번도 안 돌면 top candidate age가 계속 누적된다
+- FIFO와 모순되지 않는다
+  - buffer size가 같아도 step당 ingress group이 적으면 더 긴 step history를 담게 된다
+
+### 현재 codebase에서 바로 기억할 사실
+
+- replay actor batch는 **replay-first**로 concat된다
+- critic update는 현재 replay를 직접 보지 않는다. replay는 actor batch에만 들어간다
+- 따라서 replay 분석의 핵심 clip metric은 `critic/vf_clipfrac`가 아니라 actor 쪽 split metric이다
+
+## 최신 replay 옵션 지도
+
+### ingress filter mode
+
+- config key: `algorithm.m2_replay.selection.ingress_filter_mode`
+- 지원 값:
+  - `none`
+  - `rlvr_halfband` : 기존 `1 <= success_count <= floor(n / 2)`
+  - `rlvr_non_degenerate` : 새 `1 <= success_count <= n - 1`
+- 기본값은 기존 동작 유지다
+
+### ZVP mode
+
+- config key: `algorithm.m2_replay.selection.zvp_mode`
+- 지원 값:
+  - `sign_only` : 기존 방식
+  - `adv_magnitude` : `|adv|` self-normalized weighted ZVP
+- 기본값은 기존 동작 유지다
+
+### rev8의 의미
+
+- `rev8`은 `rev7`에서 두 가지만 바꾼 버전이다
+  - `ingress_filter_mode=rlvr_non_degenerate`
+  - `zvp_mode=adv_magnitude`
+- 목적은 final uplift 보장보다 먼저 replay activation deadlock을 깨는 것이다
+
+## 최신 코드 위치 메모
+
+- replay source flag 추가 위치:
+  - `verl/trainer/ppo/m2_replay_adapter.py`
+  - key: `m2_replay_source`
+- source별 actor metric 계산:
+  - `verl/trainer/ppo/core_algos.py`
+  - helper: `_build_source_split_pg_metrics`
+- actor worker 전달 경로:
+  - `verl/workers/actor/dp_actor.py`
+  - `verl/workers/actor/megatron_actor.py`
+  - `verl/workers/utils/losses.py`
+
+## W&B 해석 규칙
+
+### sequence length clipping 관련
+
+- `response_length/clip_ratio`는 exact truncation ratio가 아니라 proxy에 가깝다
+- `response_length_non_aborted/clip_ratio`를 우선적으로 보는 편이 안전하다
+- 작은 차이는 과해석하지 말고, 큰 차이만 strong signal로 해석한다
+
+### PPO clipping 관련
+
+- `actor/pg_clipfrac`와 `critic/vf_clipfrac`는 sequence truncation과 무관하다
+- 둘은 PPO objective/value clipping 비율이다
+- replay가 들어간 후에는 `actor/pg_clipfrac` 단일 값만으로는 해석이 부족하다
+
+### 새로 추가된 replay/on-policy split actor 로그
+
+- `actor/replay_pg_clipfrac`
+- `actor/onpolicy_pg_clipfrac`
+- `actor/replay_pg_clipfrac_lower`
+- `actor/onpolicy_pg_clipfrac_lower`
+- `actor/replay_ppo_kl`
+- `actor/onpolicy_ppo_kl`
+- `actor/replay_seq_frac`
+- `actor/replay_token_frac`
+
+해석 원칙:
+
+- `replay_token_frac` 없이 replay clipfrac만 보지 말 것
+- `replay_pg_clipfrac > onpolicy_pg_clipfrac`이면 replay 쪽이 더 aggressive / off-policy update 영역에 있을 가능성이 높다
+- `replay_ppo_kl > onpolicy_ppo_kl`이면 replay 샘플이 현재 policy와 더 멀다는 뜻이다
+
+## rev8 이후 체크리스트
+
+1. `m2_replay/selection/replay_used > 0`가 안정적으로 유지되는가
+2. top-ranked candidate `age`가 `rev7` 대비 낮아지는가
+3. selected success bucket이 `1/16` 독점에서 벗어나는가
+4. `actor/replay_token_frac`가 충분한가
+5. `actor/replay_pg_clipfrac`가 `actor/onpolicy_pg_clipfrac`보다 과도하게 높지 않은가
+6. `actor/replay_ppo_kl`가 `actor/onpolicy_ppo_kl`보다 구조적으로 너무 크지 않은가
+
+## 테스트 상태
+
+- replay option / adapter / core algo 관련 CPU 테스트는 `conda activate verl` 환경에서 통과 확인
+- 현재 보강 이후 기준:
+  - replay adapter source flag 테스트 포함
+  - replay/on-policy split actor metric 테스트 포함
 
 ## 핵심 코드 위치
 

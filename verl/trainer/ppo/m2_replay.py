@@ -32,6 +32,12 @@ class QueryGroup:
     # Deprecated legacy field retained for checkpoint compatibility.
     zvp_mean_pos_adv: float = 0.0
     zvp_pos_frac: float = 0.0
+    zvp_score_num: float = 0.0
+    zvp_score_denom: float = 0.0
+    zvp_mean_surprisal_num: float = 0.0
+    zvp_token_count: int = 0
+    zvp_neg_count: int = 0
+    zvp_pos_count: int = 0
     zvp_last_update_step: int = -1
     zvp_update_count: int = 0
 
@@ -129,6 +135,18 @@ class QueryGroupReplayBuffer:
                 group.zvp_mean_pos_adv = 0.0
             if not hasattr(group, "zvp_pos_frac"):
                 group.zvp_pos_frac = 0.0
+            if not hasattr(group, "zvp_score_num"):
+                group.zvp_score_num = 0.0
+            if not hasattr(group, "zvp_score_denom"):
+                group.zvp_score_denom = 0.0
+            if not hasattr(group, "zvp_mean_surprisal_num"):
+                group.zvp_mean_surprisal_num = 0.0
+            if not hasattr(group, "zvp_token_count"):
+                group.zvp_token_count = 0
+            if not hasattr(group, "zvp_neg_count"):
+                group.zvp_neg_count = 0
+            if not hasattr(group, "zvp_pos_count"):
+                group.zvp_pos_count = 0
             if not hasattr(group, "zvp_last_update_step"):
                 group.zvp_last_update_step = int(getattr(group, "insertion_step", 0))
             if not hasattr(group, "zvp_update_count"):
@@ -140,6 +158,93 @@ def normalize_zvp_mode(zvp_mode: str) -> str:
     if normalized_mode not in {"sign_only", "adv_magnitude"}:
         return "sign_only"
     return normalized_mode
+
+
+def compute_group_zvp_sufficient_stats_batched(
+    log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    adv_pos_eps: float = 1e-8,
+    lambda_neg: float = 1.0,
+    zvp_mode: str = "sign_only",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return exact sufficient statistics for batched ZVP computation."""
+    if log_probs.shape != advantages.shape or log_probs.shape != response_mask.shape:
+        raise ValueError(
+            f"Shape mismatch in batched ZVP stats: {log_probs.shape=}, {advantages.shape=}, {response_mask.shape=}"
+        )
+    if log_probs.ndim < 2:
+        raise ValueError(f"Batched ZVP expects ndim >= 2, got {log_probs.ndim}")
+
+    num_groups = int(log_probs.shape[0])
+    flat_log_probs = log_probs.float().reshape(num_groups, -1)
+    flat_adv = advantages.float().reshape(num_groups, -1)
+    flat_mask = response_mask.bool().reshape(num_groups, -1)
+
+    mask_f = flat_mask.float()
+    token_count = mask_f.sum(dim=1)
+    surprisal = (-flat_log_probs).clamp_min(0.0)
+    probs = torch.exp(-surprisal).clamp(0.0, 1.0)
+
+    pos_mask = flat_mask & (flat_adv > float(adv_pos_eps))
+    neg_mask = flat_mask & (flat_adv < -float(adv_pos_eps))
+    pos_count = pos_mask.sum(dim=1).float()
+    neg_count = neg_mask.sum(dim=1).float()
+
+    pos_term = torch.where(pos_mask, 1.0 - probs, torch.zeros_like(probs))
+    neg_term = torch.where(neg_mask, probs, torch.zeros_like(probs))
+    token_score = pos_term + float(lambda_neg) * neg_term
+
+    normalized_mode = normalize_zvp_mode(zvp_mode)
+    if normalized_mode == "adv_magnitude":
+        active_mask = pos_mask | neg_mask
+        score_denom = torch.where(active_mask, flat_adv.abs(), torch.zeros_like(flat_adv)).sum(dim=1)
+        score_num = (token_score * torch.where(active_mask, flat_adv.abs(), torch.zeros_like(flat_adv))).sum(dim=1)
+    else:
+        score_denom = token_count
+        score_num = (token_score * mask_f).sum(dim=1)
+
+    mean_surprisal_num = (surprisal * mask_f).sum(dim=1)
+    return (score_num, score_denom, mean_surprisal_num, token_count, neg_count, pos_count)
+
+
+def compute_group_zvp_stats_batched(
+    log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    adv_pos_eps: float = 1e-8,
+    lambda_neg: float = 1.0,
+    zvp_mode: str = "sign_only",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Vectorized ZVP statistics for a batch of groups.
+
+    The first dimension is treated as group dimension; all remaining dimensions are
+    flattened into the token dimension for each group.
+    """
+    score_num, score_denom, mean_surprisal_num, token_count, neg_count, pos_count = (
+        compute_group_zvp_sufficient_stats_batched(
+            log_probs=log_probs,
+            advantages=advantages,
+            response_mask=response_mask,
+            adv_pos_eps=adv_pos_eps,
+            lambda_neg=lambda_neg,
+            zvp_mode=zvp_mode,
+        )
+    )
+    valid = token_count > 0
+    score = torch.where(
+        score_denom > 0,
+        score_num / score_denom.clamp_min(1e-12),
+        torch.zeros_like(score_num),
+    )
+    mean_surprisal = torch.where(
+        valid,
+        mean_surprisal_num / token_count.clamp_min(1.0),
+        torch.zeros_like(mean_surprisal_num),
+    )
+    neg_frac = torch.where(valid, neg_count / token_count.clamp_min(1.0), torch.zeros_like(neg_count))
+    pos_frac = torch.where(valid, pos_count / token_count.clamp_min(1.0), torch.zeros_like(pos_count))
+    return (score, mean_surprisal, neg_frac, pos_frac)
 
 
 def compute_group_zvp_stats(
@@ -157,53 +262,182 @@ def compute_group_zvp_stats(
     - adv_magnitude: self-normalized |advantage|-weighted score over the same
       bounded token terms.
     """
-    if log_probs.shape != advantages.shape or log_probs.shape != response_mask.shape:
-        raise ValueError(
-            f"Shape mismatch in ZVP stats: {log_probs.shape=}, {advantages.shape=}, {response_mask.shape=}"
-        )
+    score, mean_surprisal, neg_frac, pos_frac = compute_group_zvp_stats_batched(
+        log_probs=log_probs.unsqueeze(0),
+        advantages=advantages.unsqueeze(0),
+        response_mask=response_mask.unsqueeze(0),
+        adv_pos_eps=adv_pos_eps,
+        lambda_neg=lambda_neg,
+        zvp_mode=zvp_mode,
+    )
+    return (
+        float(score[0].item()),
+        float(mean_surprisal[0].item()),
+        float(neg_frac[0].item()),
+        float(pos_frac[0].item()),
+    )
 
-    mask = response_mask.bool()
-    if not torch.any(mask):
-        return (0.0, 0.0, 0.0, 0.0)
 
-    adv = advantages.float()
-    surprisal = (-log_probs.float()).clamp_min(0.0)
-    probs = torch.exp(-surprisal).clamp(0.0, 1.0)
+def update_query_groups_zvp_stats(
+    groups: Iterable[QueryGroup],
+    *,
+    adv_pos_eps: float = 1e-8,
+    lambda_neg: float = 1.0,
+    zvp_mode: str = "sign_only",
+    update_step: Optional[int] = None,
+    only_missing: bool = False,
+    chunk_size: int = 64,
+) -> int:
+    """Refresh cached ZVP statistics for query groups in chunks."""
+    required_keys = {"old_log_probs", "advantages", "response_mask"}
+    candidates: list[QueryGroup] = []
+    for group in groups:
+        if only_missing and int(getattr(group, "zvp_update_count", 0)) > 0:
+            continue
+        batch = getattr(group.data, "batch", None)
+        if batch is None or not required_keys.issubset(set(batch.keys())):
+            continue
+        candidates.append(group)
 
-    pos_mask = mask & (adv > float(adv_pos_eps))
-    neg_mask = mask & (adv < -float(adv_pos_eps))
-    pos_count = int(pos_mask.sum().item())
-    neg_count = int(neg_mask.sum().item())
-    total_count = int(mask.sum().item())
-    if total_count <= 0:
-        return (0.0, 0.0, 0.0, 0.0)
+    if not candidates:
+        return 0
 
-    pos_term = torch.zeros_like(probs)
-    neg_term = torch.zeros_like(probs)
-    if pos_count > 0:
-        pos_term[pos_mask] = 1.0 - probs[pos_mask]
-    if neg_count > 0:
-        neg_term[neg_mask] = probs[neg_mask]
-
-    token_score = pos_term + float(lambda_neg) * neg_term
     normalized_mode = normalize_zvp_mode(zvp_mode)
-    if normalized_mode == "adv_magnitude":
-        active_mask = pos_mask | neg_mask
-        abs_adv = adv.abs()
-        weights = torch.zeros_like(abs_adv)
-        weights[active_mask] = abs_adv[active_mask]
-        denom = float(weights.sum().item())
-        if denom > 0.0:
-            score = float(((token_score * weights).sum() / denom).item())
-        else:
-            score = 0.0
-    else:
-        score = float(token_score[mask].mean().item())
+    chunk_size = max(int(chunk_size), 1)
+    processed = 0
+    for start in range(0, len(candidates), chunk_size):
+        chunk = candidates[start : start + chunk_size]
+        log_probs = torch.stack([group.data.batch["old_log_probs"] for group in chunk], dim=0)
+        advantages = torch.stack([group.data.batch["advantages"] for group in chunk], dim=0)
+        response_mask = torch.stack([group.data.batch["response_mask"] for group in chunk], dim=0)
+        score_num, score_denom, mean_surprisal_num, token_count, neg_count, pos_count = (
+            compute_group_zvp_sufficient_stats_batched(
+                log_probs=log_probs,
+                advantages=advantages,
+                response_mask=response_mask,
+                adv_pos_eps=adv_pos_eps,
+                lambda_neg=lambda_neg,
+                zvp_mode=normalized_mode,
+            )
+        )
+        valid = token_count > 0
+        scores = torch.where(
+            score_denom > 0,
+            score_num / score_denom.clamp_min(1e-12),
+            torch.zeros_like(score_num),
+        )
+        mean_surprisal = torch.where(
+            valid,
+            mean_surprisal_num / token_count.clamp_min(1.0),
+            torch.zeros_like(mean_surprisal_num),
+        )
+        neg_frac = torch.where(valid, neg_count / token_count.clamp_min(1.0), torch.zeros_like(neg_count))
+        pos_frac = torch.where(valid, pos_count / token_count.clamp_min(1.0), torch.zeros_like(pos_count))
+        summary = torch.stack(
+            [
+                scores,
+                mean_surprisal,
+                neg_frac,
+                pos_frac,
+                score_num,
+                score_denom,
+                mean_surprisal_num,
+                token_count,
+                neg_count,
+                pos_count,
+            ],
+            dim=1,
+        ).detach()
+        summary_cpu = summary.cpu().tolist()
+        for idx, group in enumerate(chunk):
+            (
+                group.zvp_score,
+                group.zvp_mean_surprisal,
+                group.zvp_neg_frac,
+                group.zvp_pos_frac,
+                group.zvp_score_num,
+                group.zvp_score_denom,
+                group.zvp_mean_surprisal_num,
+                group_token_count,
+                group_neg_count,
+                group_pos_count,
+            ) = summary_cpu[idx]
+            group.zvp_token_count = int(group_token_count)
+            group.zvp_neg_count = int(group_neg_count)
+            group.zvp_pos_count = int(group_pos_count)
+            if update_step is not None:
+                group.zvp_last_update_step = int(update_step)
+            elif int(getattr(group, "zvp_last_update_step", -1)) < 0:
+                group.zvp_last_update_step = int(getattr(group, "insertion_step", 0))
+            group.zvp_update_count = int(getattr(group, "zvp_update_count", 0)) + 1
+        processed += len(chunk)
+    return processed
 
-    mean_surprisal = float(surprisal[mask].mean().item())
-    pos_frac = float(pos_count / total_count)
-    neg_frac = float(neg_count / total_count)
-    return (score, mean_surprisal, neg_frac, pos_frac)
+
+def compute_group_m2_batched(
+    old_log_probs: torch.Tensor,
+    new_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> torch.Tensor:
+    if old_log_probs.shape != new_log_probs.shape:
+        raise ValueError(f"Shape mismatch: {old_log_probs.shape=} vs {new_log_probs.shape=}")
+    if response_mask.shape != old_log_probs.shape:
+        raise ValueError(
+            f"Mask shape mismatch: {response_mask.shape=} vs log_probs shape {old_log_probs.shape=}"
+        )
+    if old_log_probs.ndim < 2:
+        raise ValueError(f"Batched M2 expects ndim >= 2, got {old_log_probs.ndim}")
+
+    num_groups = int(old_log_probs.shape[0])
+    old_flat = old_log_probs.float().reshape(num_groups, -1)
+    new_flat = new_log_probs.float().reshape(num_groups, -1)
+    mask_f = response_mask.float().reshape(num_groups, -1)
+    denom = mask_f.sum(dim=1)
+    ell = new_flat - old_flat
+    m2_num = (ell.square() * mask_f).sum(dim=1)
+    inf_value = torch.full_like(m2_num, float("inf"))
+    return torch.where(denom > 0, m2_num / denom.clamp_min(1.0), inf_value)
+
+
+def compute_group_runtime_zvp_stats_batched(
+    groups: list[QueryGroup],
+    new_log_probs_list: list[torch.Tensor],
+    *,
+    adv_pos_eps: float = 1e-8,
+    lambda_neg: float = 1.0,
+    zvp_mode: str = "sign_only",
+) -> list[tuple[float, float, float, float]]:
+    if not groups:
+        return []
+
+    runtime_stats: list[tuple[float, float, float, float]] = [(0.0, 0.0, 0.0, 0.0) for _ in groups]
+    indexed_groups: list[tuple[int, QueryGroup]] = []
+    indexed_log_probs: list[torch.Tensor] = []
+    for idx, group in enumerate(groups):
+        batch = getattr(group.data, "batch", None)
+        if batch is None or "advantages" not in batch.keys() or "response_mask" not in batch.keys():
+            continue
+        indexed_groups.append((idx, group))
+        indexed_log_probs.append(new_log_probs_list[idx])
+
+    if not indexed_groups:
+        return runtime_stats
+
+    log_probs = torch.stack(indexed_log_probs, dim=0)
+    advantages = torch.stack([group.data.batch["advantages"] for _, group in indexed_groups], dim=0)
+    response_mask = torch.stack([group.data.batch["response_mask"] for _, group in indexed_groups], dim=0)
+    scores, mean_surprisal, neg_frac, pos_frac = compute_group_zvp_stats_batched(
+        log_probs=log_probs,
+        advantages=advantages,
+        response_mask=response_mask,
+        adv_pos_eps=adv_pos_eps,
+        lambda_neg=lambda_neg,
+        zvp_mode=zvp_mode,
+    )
+    summary = torch.stack([scores, mean_surprisal, neg_frac, pos_frac], dim=1).detach().cpu().tolist()
+    for row, (idx, _) in zip(summary, indexed_groups, strict=True):
+        runtime_stats[idx] = (float(row[0]), float(row[1]), float(row[2]), float(row[3]))
+    return runtime_stats
 
 
 def _stable_seed_rank(query_id: str, seed: int) -> int:
@@ -273,21 +507,12 @@ def _priority_terms(
 
 
 def compute_group_m2(old_log_probs: torch.Tensor, new_log_probs: torch.Tensor, response_mask: torch.Tensor) -> float:
-    if old_log_probs.shape != new_log_probs.shape:
-        raise ValueError(f"Shape mismatch: {old_log_probs.shape=} vs {new_log_probs.shape=}")
-    if response_mask.shape != old_log_probs.shape:
-        raise ValueError(
-            f"Mask shape mismatch: {response_mask.shape=} vs log_probs shape {old_log_probs.shape=}"
-        )
-
-    mask = response_mask.float()
-    denom = float(mask.sum().item())
-    if denom <= 0:
-        return float("inf")
-
-    ell = (new_log_probs - old_log_probs).float()
-    m2 = (ell.square() * mask).sum() / denom
-    return float(m2.item())
+    m2 = compute_group_m2_batched(
+        old_log_probs=old_log_probs.unsqueeze(0),
+        new_log_probs=new_log_probs.unsqueeze(0),
+        response_mask=response_mask.unsqueeze(0),
+    )
+    return float(m2[0].item())
 
 
 def select_replay_groups(
@@ -391,6 +616,44 @@ def select_replay_groups(
     rejected_eval_error = 0
     scanned_groups = 0
 
+    def _append_selected_group(
+        group: QueryGroup,
+        *,
+        m2: float,
+        runtime_stats: tuple[float, float, float, float],
+    ) -> None:
+        runtime_zvp_score, runtime_zvp_mean_surprisal, runtime_zvp_neg_frac, runtime_zvp_pos_frac = runtime_stats
+        selected.append(group)
+        accepted_m2.append(m2)
+        priority_score, uncertainty, recency_value, age, last_training_step = _priority_terms(
+            group=group,
+            current_step=current_step,
+            selection_mode=normalized_mode,
+            recency_beta=recency_beta,
+            recency_decay_lambda=recency_decay_lambda,
+            zvp_weight=zvp_weight,
+            zvp_use_recency=zvp_use_recency,
+        )
+        selected_priority_debug.append(
+            {
+                "query_id": group.query_id,
+                "score": priority_score,
+                "uncertainty": uncertainty,
+                "recency_value": recency_value,
+                "age": age,
+                "last_training_step": last_training_step,
+                "success_prob": float(group.success_prob),
+                "success_count": int(group.success_count),
+                "group_size": int(group.group_size),
+                "m2": float(m2),
+                "zvp_score": float(group.zvp_score),
+                "zvp_runtime_score": float(runtime_zvp_score),
+                "zvp_runtime_mean_surprisal": float(runtime_zvp_mean_surprisal),
+                "zvp_runtime_neg_frac": float(runtime_zvp_neg_frac),
+                "zvp_runtime_pos_frac": float(runtime_zvp_pos_frac),
+            }
+        )
+
     def _accept_if_passing_tau(group: QueryGroup, new_log_probs: torch.Tensor) -> None:
         nonlocal rejected_by_tau
         t0 = time.perf_counter()
@@ -399,55 +662,16 @@ def select_replay_groups(
         m2 = compute_group_m2(old_log_probs=old_log_probs, new_log_probs=new_log_probs, response_mask=response_mask)
 
         if m2 <= tau:
-            runtime_zvp_score = 0.0
-            runtime_zvp_mean_surprisal = 0.0
-            runtime_zvp_neg_frac = 0.0
-            runtime_zvp_pos_frac = 0.0
+            runtime_stats = (0.0, 0.0, 0.0, 0.0)
             if "advantages" in group.data.batch.keys():
-                (
-                    runtime_zvp_score,
-                    runtime_zvp_mean_surprisal,
-                    runtime_zvp_neg_frac,
-                    runtime_zvp_pos_frac,
-                ) = compute_group_zvp_stats(
-                    log_probs=new_log_probs,
-                    advantages=group.data.batch["advantages"],
-                    response_mask=response_mask,
+                runtime_stats = compute_group_runtime_zvp_stats_batched(
+                    [group],
+                    [new_log_probs],
                     adv_pos_eps=adv_pos_eps,
                     lambda_neg=zvp_lambda_neg,
                     zvp_mode=normalized_zvp_mode,
-                )
-
-            selected.append(group)
-            accepted_m2.append(m2)
-            priority_score, uncertainty, recency_value, age, last_training_step = _priority_terms(
-                group=group,
-                current_step=current_step,
-                selection_mode=normalized_mode,
-                recency_beta=recency_beta,
-                recency_decay_lambda=recency_decay_lambda,
-                zvp_weight=zvp_weight,
-                zvp_use_recency=zvp_use_recency,
-            )
-            selected_priority_debug.append(
-                {
-                    "query_id": group.query_id,
-                    "score": priority_score,
-                    "uncertainty": uncertainty,
-                    "recency_value": recency_value,
-                    "age": age,
-                    "last_training_step": last_training_step,
-                    "success_prob": float(group.success_prob),
-                    "success_count": int(group.success_count),
-                    "group_size": int(group.group_size),
-                    "m2": float(m2),
-                    "zvp_score": float(group.zvp_score),
-                    "zvp_runtime_score": float(runtime_zvp_score),
-                    "zvp_runtime_mean_surprisal": float(runtime_zvp_mean_surprisal),
-                    "zvp_runtime_neg_frac": float(runtime_zvp_neg_frac),
-                    "zvp_runtime_pos_frac": float(runtime_zvp_pos_frac),
-                }
-            )
+                )[0]
+            _append_selected_group(group, m2=float(m2), runtime_stats=runtime_stats)
         else:
             rejected_by_tau += 1
         if timing_raw is not None:
@@ -530,13 +754,67 @@ def select_replay_groups(
                         rejected_eval_error += 1
                 continue
 
-            for group, new_log_probs in zip(valid_groups, new_log_probs_list, strict=True):
+            try:
+                t0 = time.perf_counter()
+                old_log_probs = torch.stack([group.data.batch["old_log_probs"] for group in valid_groups], dim=0)
+                response_mask = torch.stack([group.data.batch["response_mask"] for group in valid_groups], dim=0)
+                new_log_probs = torch.stack(new_log_probs_list, dim=0)
+                m2_values = compute_group_m2_batched(
+                    old_log_probs=old_log_probs,
+                    new_log_probs=new_log_probs,
+                    response_mask=response_mask,
+                )
+                if timing_raw is not None:
+                    timing_raw["m2_select_m2_eval"] = timing_raw.get("m2_select_m2_eval", 0.0) + (
+                        time.perf_counter() - t0
+                    )
+            except Exception:
+                for group, new_log_probs_single in zip(valid_groups, new_log_probs_list, strict=True):
+                    if len(selected) >= target_groups:
+                        break
+                    try:
+                        _accept_if_passing_tau(group, new_log_probs_single)
+                    except Exception:
+                        rejected_eval_error += 1
+                continue
+
+            remaining_slots = max(int(target_groups) - len(selected), 0)
+            accepted_indices: list[int] = []
+            m2_cpu = m2_values.detach().cpu().tolist()
+            for idx, m2 in enumerate(m2_cpu):
+                if len(accepted_indices) >= remaining_slots:
+                    break
+                if float(m2) <= float(tau):
+                    accepted_indices.append(idx)
+                else:
+                    rejected_by_tau += 1
+
+            runtime_stats_map: dict[int, tuple[float, float, float, float]] = {}
+            if accepted_indices:
+                accepted_groups = [valid_groups[idx] for idx in accepted_indices]
+                accepted_new_log_probs = [new_log_probs_list[idx] for idx in accepted_indices]
+                runtime_stats = compute_group_runtime_zvp_stats_batched(
+                    accepted_groups,
+                    accepted_new_log_probs,
+                    adv_pos_eps=adv_pos_eps,
+                    lambda_neg=zvp_lambda_neg,
+                    zvp_mode=normalized_zvp_mode,
+                )
+                runtime_stats_map = {
+                    accepted_idx: runtime_stat
+                    for accepted_idx, runtime_stat in zip(accepted_indices, runtime_stats, strict=True)
+                }
+
+            for idx, (group, _) in enumerate(zip(valid_groups, new_log_probs_list, strict=True)):
                 if len(selected) >= target_groups:
                     break
-                try:
-                    _accept_if_passing_tau(group, new_log_probs)
-                except Exception:
-                    rejected_eval_error += 1
+                if idx not in runtime_stats_map:
+                    continue
+                _append_selected_group(
+                    group,
+                    m2=float(m2_cpu[idx]),
+                    runtime_stats=runtime_stats_map[idx],
+                )
     if timing_raw is not None:
         timing_raw["m2_select_scan_loop"] = timing_raw.get("m2_select_scan_loop", 0.0) + (
             time.perf_counter() - loop_start

@@ -5,6 +5,7 @@ import torch
 from verl import DataProto
 from verl.trainer.ppo.m2_replay import QueryGroup
 from verl.trainer.ppo.m2_replay_adapter import (
+    M2_REPLAY_SOURCE_KEY,
     build_actor_batch_with_replay,
     build_query_groups_from_onpolicy_batch,
     filter_query_groups_for_ingress,
@@ -74,6 +75,9 @@ def test_build_actor_batch_with_replay_replay_first():
     # replay-first: first two samples come from replay q1
     assert merged.non_tensor_batch["uid"][0] == "q1"
     assert merged.non_tensor_batch["uid"][1] == "q1"
+    assert M2_REPLAY_SOURCE_KEY in merged.batch.keys()
+    assert merged.batch[M2_REPLAY_SOURCE_KEY][:2].tolist() == [True, True]
+    assert merged.batch[M2_REPLAY_SOURCE_KEY][2:].tolist() == [False, False, False, False]
 
 
 def test_filter_query_groups_for_ingress_supports_non_degenerate_mode():
@@ -133,3 +137,18 @@ def test_build_query_groups_from_onpolicy_batch_supports_adv_magnitude_zvp():
     assert sign_only.groups[0].zvp_score == pytest.approx((0.8 + 0.9 + 0.9) / 3.0, rel=1e-6)
     assert adv_magnitude.groups[0].zvp_score == pytest.approx((0.8 * 10.0 + 0.9 + 0.9) / 12.0, rel=1e-6)
     assert adv_magnitude.groups[0].zvp_score < sign_only.groups[0].zvp_score
+
+
+def test_build_query_groups_from_onpolicy_batch_can_skip_initial_zvp_init():
+    batch = _make_onpolicy_batch()
+
+    result = build_query_groups_from_onpolicy_batch(
+        batch=batch,
+        expected_group_size=2,
+        insertion_step=42,
+        compute_zvp_stats=False,
+    )
+
+    assert len(result.groups) == 2
+    assert all(group.zvp_update_count == 0 for group in result.groups)
+    assert all(group.zvp_score == 0.0 for group in result.groups)

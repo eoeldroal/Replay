@@ -56,11 +56,13 @@ from verl.trainer.ppo.m2_replay import (
     derive_micro_group_multiple,
     normalize_zvp_mode,
     select_replay_groups,
+    update_query_groups_zvp_stats,
 )
 from verl.trainer.ppo.m2_replay_adapter import (
     build_actor_batch_from_groups,
     build_actor_batch_with_replay,
     build_query_groups_from_onpolicy_batch,
+    derive_ingress_success_band,
     filter_query_groups_for_ingress,
     normalize_ingress_filter_mode,
     split_query_groups_by_adv_zero,
@@ -403,6 +405,7 @@ class RayPPOTrainer:
         self.m2_replay_training_mode = "legacy_bonus"
         self.m2_replay_fixed_total_groups = 0
         self.m2_replay_fixed_total_floor_groups = 0
+        self.m2_replay_start_mode = "immediate"
         self.m2_replay_one_turnover_gate = False
         self.m2_replay_adv_zero_eps = 1e-8
         self.m2_replay_buffer: Optional[QueryGroupReplayBuffer] = None
@@ -496,7 +499,21 @@ class RayPPOTrainer:
                     flush=True,
                 )
                 self.m2_replay_fixed_total_floor_groups = 0
-            self.m2_replay_one_turnover_gate = bool(schedule_cfg.get("one_turnover_gate", False))
+            start_mode_cfg = schedule_cfg.get("start_mode", None)
+            if start_mode_cfg is None or str(start_mode_cfg).strip() == "":
+                legacy_one_turnover_gate = bool(schedule_cfg.get("one_turnover_gate", False))
+                start_mode_cfg = "two_turnovers" if legacy_one_turnover_gate else "immediate"
+            start_mode_raw = str(start_mode_cfg).strip().lower()
+            valid_start_modes = {"immediate", "buffer_full", "two_turnovers"}
+            if start_mode_raw not in valid_start_modes:
+                print(
+                    f"[m2_replay] Warning: unknown schedule.start_mode={start_mode_raw}. "
+                    "Fallback to immediate.",
+                    flush=True,
+                )
+                start_mode_raw = "immediate"
+            self.m2_replay_start_mode = start_mode_raw
+            self.m2_replay_one_turnover_gate = self.m2_replay_start_mode == "two_turnovers"
             self.m2_replay_prefix = str(logging_cfg.get("prefix", "m2_replay"))
             self.m2_replay_dump_full_scores = bool(logging_cfg.get("dump_full_scores", True))
             custom_full_scores_dir = logging_cfg.get("full_scores_dir", None)
@@ -1697,19 +1714,49 @@ class RayPPOTrainer:
 
         # Build full on-policy groups once; derive ingress subset via filter.
         with marked_timer("m2_prepare_onpolicy_groups", m2_timing_raw, color="yellow"):
-            group_build_result = build_query_groups_from_onpolicy_batch(
-                batch=batch,
-                expected_group_size=rollout_n,
-                insertion_step=self.global_steps,
-                zvp_lambda_neg=self.m2_replay_zvp_lambda_neg,
-                zvp_mode=self.m2_replay_zvp_mode,
-            )
-            onpolicy_all_groups = group_build_result.groups
-            onpolicy_ingress_groups, skipped_by_success_band = filter_query_groups_for_ingress(
-                groups=onpolicy_all_groups,
+            ingress_success_count_min, ingress_success_count_max = derive_ingress_success_band(
                 rollout_n=rollout_n,
                 ingress_filter_mode=self.m2_replay_ingress_filter_mode,
             )
+            should_init_onpolicy_zvp = (
+                self.m2_replay_start_mode == "immediate" and self.m2_replay_selection_mode == "zvp_recency"
+            )
+            if self.m2_replay_training_mode == "fixed_total_with_adv0_drop":
+                group_build_result = build_query_groups_from_onpolicy_batch(
+                    batch=batch,
+                    expected_group_size=rollout_n,
+                    insertion_step=self.global_steps,
+                    zvp_lambda_neg=self.m2_replay_zvp_lambda_neg,
+                    zvp_mode=self.m2_replay_zvp_mode,
+                    compute_zvp_stats=False,
+                )
+                onpolicy_all_groups = group_build_result.groups
+                onpolicy_ingress_groups, skipped_by_success_band = filter_query_groups_for_ingress(
+                    groups=onpolicy_all_groups,
+                    rollout_n=rollout_n,
+                    ingress_filter_mode=self.m2_replay_ingress_filter_mode,
+                )
+                if should_init_onpolicy_zvp and onpolicy_ingress_groups:
+                    update_query_groups_zvp_stats(
+                        onpolicy_ingress_groups,
+                        lambda_neg=self.m2_replay_zvp_lambda_neg,
+                        zvp_mode=self.m2_replay_zvp_mode,
+                        update_step=int(self.global_steps),
+                    )
+            else:
+                group_build_result = build_query_groups_from_onpolicy_batch(
+                    batch=batch,
+                    expected_group_size=rollout_n,
+                    insertion_step=self.global_steps,
+                    success_count_min=ingress_success_count_min,
+                    success_count_max=ingress_success_count_max,
+                    zvp_lambda_neg=self.m2_replay_zvp_lambda_neg,
+                    zvp_mode=self.m2_replay_zvp_mode,
+                    compute_zvp_stats=should_init_onpolicy_zvp,
+                )
+                onpolicy_ingress_groups = group_build_result.groups
+                skipped_by_success_band = group_build_result.skipped_by_success_band
+                onpolicy_all_groups = onpolicy_ingress_groups
 
         metrics[self._m2_key("buffer/new_groups")] = float(len(onpolicy_ingress_groups))
         metrics[self._m2_key("buffer/skipped_incomplete")] = float(group_build_result.skipped_incomplete)
@@ -1777,15 +1824,30 @@ class RayPPOTrainer:
         buffer_size_pre_select = len(self.m2_replay_buffer)
         buffer_capacity = int(self.m2_replay_buffer.max_query_groups)
         buffer_inserted = int(getattr(self.m2_replay_buffer, "_insertion_counter", buffer_size_pre_select))
-        one_turnover_ready = (buffer_size_pre_select >= buffer_capacity) and (buffer_inserted >= (2 * buffer_capacity))
+        buffer_full_ready = buffer_size_pre_select >= buffer_capacity
+        two_turnovers_ready = buffer_full_ready and (buffer_inserted >= (2 * buffer_capacity))
+        if self.m2_replay_start_mode == "buffer_full":
+            selection_ready = buffer_full_ready
+        elif self.m2_replay_start_mode == "two_turnovers":
+            selection_ready = two_turnovers_ready
+        else:
+            selection_ready = True
+        metrics[self._m2_key("gating/start_mode_immediate")] = float(self.m2_replay_start_mode == "immediate")
+        metrics[self._m2_key("gating/start_mode_buffer_full")] = float(self.m2_replay_start_mode == "buffer_full")
+        metrics[self._m2_key("gating/start_mode_two_turnovers")] = float(
+            self.m2_replay_start_mode == "two_turnovers"
+        )
+        metrics[self._m2_key("gating/buffer_full_ready")] = float(bool(buffer_full_ready))
+        metrics[self._m2_key("gating/two_turnovers_ready")] = float(bool(two_turnovers_ready))
+        metrics[self._m2_key("gating/selection_ready")] = float(bool(selection_ready))
         metrics[self._m2_key("gating/one_turnover_enabled")] = float(bool(self.m2_replay_one_turnover_gate))
-        metrics[self._m2_key("gating/one_turnover_ready")] = float(bool(one_turnover_ready))
+        metrics[self._m2_key("gating/one_turnover_ready")] = float(bool(two_turnovers_ready))
         metrics[self._m2_key("gating/buffer_size_pre_select")] = float(buffer_size_pre_select)
         metrics[self._m2_key("gating/buffer_capacity")] = float(buffer_capacity)
         metrics[self._m2_key("gating/buffer_inserted_pre_select")] = float(buffer_inserted)
 
         with marked_timer("m2_select_replay_total", m2_timing_raw, color="yellow"):
-            if self.m2_replay_one_turnover_gate and not one_turnover_ready:
+            if not selection_ready:
                 selection = ReplaySelectionResult(
                     selected_groups=[],
                     scanned_groups=0,
@@ -1795,6 +1857,16 @@ class RayPPOTrainer:
                     rejected_eval_error=0,
                 )
             else:
+                if self.m2_replay_selection_mode == "zvp_recency":
+                    backfilled_groups = update_query_groups_zvp_stats(
+                        self.m2_replay_buffer.items(),
+                        lambda_neg=self.m2_replay_zvp_lambda_neg,
+                        zvp_mode=self.m2_replay_zvp_mode,
+                        only_missing=True,
+                    )
+                    metrics[self._m2_key("gating/backfilled_buffer_groups")] = float(backfilled_groups)
+                else:
+                    metrics[self._m2_key("gating/backfilled_buffer_groups")] = 0.0
                 selection = select_replay_groups(
                     buffer=self.m2_replay_buffer,
                     target_groups=replay_target_groups,
@@ -1815,6 +1887,8 @@ class RayPPOTrainer:
                     build_candidate_priority_all=self.m2_replay_dump_full_scores,
                     timing_raw=m2_timing_raw,
                 )
+        if not selection_ready:
+            metrics[self._m2_key("gating/backfilled_buffer_groups")] = 0.0
         metrics.update(selection.to_metrics(prefix=self.m2_replay_prefix))
 
         replay_groups = selection.selected_groups
@@ -1924,7 +1998,12 @@ class RayPPOTrainer:
         onpolicy_preview = onpolicy_query_ids[:preview_limit]
         replay_preview = replay_query_ids[:preview_limit]
         score_preview_limit = 10
-        nonzero_preview = [group.query_id for group in onpolicy_nonzero_groups[:preview_limit]]
+        if self.m2_replay_training_mode == "fixed_total_with_adv0_drop":
+            onpolicy_nonzero_count = len(onpolicy_nonzero_groups)
+            nonzero_preview = [group.query_id for group in onpolicy_nonzero_groups[:preview_limit]]
+        else:
+            onpolicy_nonzero_count = onpolicy_train_group_count
+            nonzero_preview = onpolicy_query_ids[:preview_limit]
         fallback_adv0_preview = [group.query_id for group in fallback_adv0_groups[:preview_limit]]
 
         def _round_score_entry(entry: dict[str, object]) -> dict[str, object]:
@@ -1984,7 +2063,7 @@ class RayPPOTrainer:
             f"replay_used={len(replay_query_ids)} "
             f"fixed_total_target_applied={applied_total_groups} "
             f"replay_trimmed_for_floor={replay_trimmed_for_floor} "
-            f"onpolicy_nonzero={len(onpolicy_nonzero_groups)} "
+            f"onpolicy_nonzero={onpolicy_nonzero_count} "
             f"onpolicy_adv0={len(onpolicy_adv0_groups)} "
             f"fallback_adv0_used={len(fallback_adv0_groups)} "
             f"final_train_groups={final_train_groups} "

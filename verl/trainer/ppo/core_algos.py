@@ -45,6 +45,7 @@ PolicyLossFn = Callable[
         str,  # loss_agg_mode
         Optional[DictConfig | ActorConfig],  # config
         torch.Tensor | None,  # rollout_log_probs
+        torch.Tensor | None,  # source_ids
     ],
     tuple[torch.Tensor, dict[str, Any]],
 ]
@@ -191,6 +192,52 @@ class _PolicyDiagWriter:
         path = os.path.join(self.dir, f"{self._session_id}_flush{self.flush_count:04d}_rank{self._rank}.pt")
         torch.save(combined, path)
         self.buffer.clear()
+
+
+def _masked_mean_or_zero(value: torch.Tensor, mask: torch.Tensor) -> float:
+    mask = mask.bool()
+    if not torch.any(mask):
+        return 0.0
+    return float(verl_F.masked_mean(value.float(), mask).detach().item())
+
+
+def _build_source_split_pg_metrics(
+    response_mask: torch.Tensor,
+    ppo_kl_term: torch.Tensor | None,
+    source_ids: torch.Tensor | None,
+    clipfrac_indicator: torch.Tensor | None = None,
+    clipfrac_lower_indicator: torch.Tensor | None = None,
+) -> dict[str, float]:
+    if source_ids is None:
+        return {}
+
+    if source_ids.dim() == 1:
+        source_mask = source_ids.bool().unsqueeze(-1).expand_as(response_mask)
+    elif source_ids.shape == response_mask.shape:
+        source_mask = source_ids.bool()
+    else:
+        raise ValueError(f"source_ids shape must be (batch,) or {tuple(response_mask.shape)}, got {tuple(source_ids.shape)}")
+
+    valid_mask = response_mask.bool()
+    replay_mask = valid_mask & source_mask
+    onpolicy_mask = valid_mask & ~source_mask
+    batch_size = int(response_mask.shape[0]) if response_mask.dim() > 0 else 0
+
+    metrics = {
+        "actor/replay_seq_frac": float(source_mask[:, 0].float().mean().detach().item()) if batch_size > 0 else 0.0,
+        "actor/replay_token_frac": _masked_mean_or_zero(source_mask.float(), valid_mask),
+    }
+    if ppo_kl_term is not None:
+        metrics["actor/replay_ppo_kl"] = _masked_mean_or_zero(ppo_kl_term, replay_mask)
+        metrics["actor/onpolicy_ppo_kl"] = _masked_mean_or_zero(ppo_kl_term, onpolicy_mask)
+
+    if clipfrac_indicator is not None:
+        metrics["actor/replay_pg_clipfrac"] = _masked_mean_or_zero(clipfrac_indicator, replay_mask)
+        metrics["actor/onpolicy_pg_clipfrac"] = _masked_mean_or_zero(clipfrac_indicator, onpolicy_mask)
+    if clipfrac_lower_indicator is not None:
+        metrics["actor/replay_pg_clipfrac_lower"] = _masked_mean_or_zero(clipfrac_lower_indicator, replay_mask)
+        metrics["actor/onpolicy_pg_clipfrac_lower"] = _masked_mean_or_zero(clipfrac_lower_indicator, onpolicy_mask)
+    return metrics
 
 
 class _DampenDiagWriter:
@@ -1458,6 +1505,7 @@ def compute_policy_loss_vanilla(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    source_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -1549,6 +1597,15 @@ def compute_policy_loss_vanilla(
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
+    pg_metrics.update(
+        _build_source_split_pg_metrics(
+            response_mask=response_mask,
+            ppo_kl_term=-negative_approx_kl,
+            source_ids=source_ids,
+            clipfrac_indicator=torch.gt(pg_losses2, pg_losses1).float(),
+            clipfrac_lower_indicator=(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float()),
+        )
+    )
     return pg_loss, pg_metrics
 
 
@@ -1561,6 +1618,7 @@ def compute_policy_loss_gspo(
     loss_agg_mode: str = "seq-mean-token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    source_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for GSPO.
@@ -1636,6 +1694,14 @@ def compute_policy_loss_gspo(
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
+    pg_metrics.update(
+        _build_source_split_pg_metrics(
+            response_mask=response_mask,
+            ppo_kl_term=-negative_approx_kl,
+            source_ids=source_ids,
+            clipfrac_indicator=torch.gt(pg_losses2, pg_losses1).float(),
+        )
+    )
     return pg_loss, pg_metrics
 
 
@@ -1648,6 +1714,7 @@ def compute_policy_loss_sapo(
     loss_agg_mode: str = "seq-mean-token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    source_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the smoothed policy objective and related metrics for SAPO.
@@ -1720,6 +1787,13 @@ def compute_policy_loss_sapo(
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
+    pg_metrics.update(
+        _build_source_split_pg_metrics(
+            response_mask=response_mask,
+            ppo_kl_term=-negative_approx_kl,
+            source_ids=source_ids,
+        )
+    )
 
     return pg_loss, pg_metrics
 
@@ -1733,6 +1807,7 @@ def compute_policy_loss_gpg(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    source_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Adapted from
     https://github.com/AMAP-ML/GPG/blob/main/VisualThinker-R1-Zero/src/open-r1-multimodal/src/open_r1/trainer/grpo_trainer.py#L495
@@ -1769,6 +1844,7 @@ def compute_policy_loss_clip_cov(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    source_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for Clip-Cov.
@@ -1862,6 +1938,14 @@ def compute_policy_loss_clip_cov(
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
         "actor/ppo_kl": ppo_kl.detach().item(),
     }
+    pg_metrics.update(
+        _build_source_split_pg_metrics(
+            response_mask=response_mask,
+            ppo_kl_term=-negative_approx_kl,
+            source_ids=source_ids,
+            clipfrac_indicator=(corr == 0).float(),
+        )
+    )
     return pg_loss, pg_metrics
 
 
@@ -1874,6 +1958,7 @@ def compute_policy_loss_kl_cov(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    source_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for Clip-Cov.
@@ -1942,6 +2027,13 @@ def compute_policy_loss_kl_cov(
     pg_metrics = {
         "actor/ppo_kl": ppo_kl_abs.detach().item(),
     }
+    pg_metrics.update(
+        _build_source_split_pg_metrics(
+            response_mask=response_mask,
+            ppo_kl_term=abs_kl,
+            source_ids=source_ids,
+        )
+    )
     return pg_loss, pg_metrics
 
 
@@ -1954,6 +2046,7 @@ def compute_policy_loss_geo_mean(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    source_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for GMPO.
@@ -2028,6 +2121,15 @@ def compute_policy_loss_geo_mean(
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
+    pg_metrics.update(
+        _build_source_split_pg_metrics(
+            response_mask=response_mask,
+            ppo_kl_term=-negative_approx_kl,
+            source_ids=source_ids,
+            clipfrac_indicator=(clipped * (advantages > 0)).float(),
+            clipfrac_lower_indicator=(clipped * (advantages < 0)).float(),
+        )
+    )
     return pg_loss, pg_metrics
 
 
@@ -2040,6 +2142,7 @@ def compute_policy_loss_cispo(
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    source_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for CISPO.
@@ -2098,6 +2201,14 @@ def compute_policy_loss_cispo(
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
+    pg_metrics.update(
+        _build_source_split_pg_metrics(
+            response_mask=response_mask,
+            ppo_kl_term=-negative_approx_kl,
+            source_ids=source_ids,
+            clipfrac_indicator=(ratio != clipped_ratio).float(),
+        )
+    )
     return pg_loss, pg_metrics
 
 
@@ -2110,6 +2221,7 @@ def compute_policy_loss_gcispo(
     loss_agg_mode: str = "seq-mean-token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    source_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the policy loss for GCISPO (GSPO + CISPO combined).
@@ -2231,6 +2343,14 @@ def compute_policy_loss_gcispo(
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
+    pg_metrics.update(
+        _build_source_split_pg_metrics(
+            response_mask=response_mask,
+            ppo_kl_term=-negative_approx_kl,
+            source_ids=source_ids,
+            clipfrac_indicator=is_clipped.float(),
+        )
+    )
     return pg_loss, pg_metrics
 
 
@@ -2444,6 +2564,7 @@ def compute_policy_loss_reinforce(
     loss_agg_mode: str = "seq-mean-token-sum",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: Optional[torch.Tensor] = None,
+    source_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Compute REINFORCE-style policy gradient loss with optional IS correction.
 
@@ -2512,6 +2633,13 @@ def compute_policy_loss_reinforce(
     pg_metrics = {
         "actor/ppo_kl": kl_divergence.detach().item(),
     }
+    pg_metrics.update(
+        _build_source_split_pg_metrics(
+            response_mask=response_mask,
+            ppo_kl_term=-negative_approx_kl,
+            source_ids=source_ids,
+        )
+    )
 
     return pg_loss, pg_metrics
 
@@ -2525,6 +2653,7 @@ def compute_policy_loss_bypass_mode(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    source_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Bypass mode policy loss supporting both REINFORCE and PPO-clip.
 
@@ -2636,6 +2765,7 @@ def compute_policy_loss_bypass_mode(
             loss_agg_mode=loss_agg_mode,
             config=config,
             rollout_is_weights=computed_is_weights,
+            source_ids=source_ids,
         )
 
     elif loss_type == "ppo_clip":
@@ -2650,6 +2780,7 @@ def compute_policy_loss_bypass_mode(
             loss_agg_mode=loss_agg_mode,
             config=config,
             rollout_is_weights=None,  # Explicitly None - no IS weights for PPO-clip
+            source_ids=source_ids,
         )
 
     else:
