@@ -19,6 +19,7 @@ Single Process Actor
 
 import logging
 import os
+import time
 
 import torch
 from torch import nn
@@ -538,7 +539,9 @@ class DataParallelPPOActor(BasePPOActor):
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
+        t0 = time.perf_counter()
         mini_batches = data.split(self.config.ppo_mini_batch_size)
+        t_split_minibatch = time.perf_counter() - t0
 
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
@@ -546,16 +549,24 @@ class DataParallelPPOActor(BasePPOActor):
             "actor/pg_loss": 0.0,
             "actor/kl_loss": 0.0,
         }
+        t_split_microbatch = 0.0
+        t_forward_micro = 0.0
+        t_backward_micro = 0.0
+        t_optimizer_step = 0.0
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                    t0 = time.perf_counter()
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
+                    t_split_microbatch += time.perf_counter() - t0
                 else:
+                    t0 = time.perf_counter()
                     self.gradient_accumulation = (
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     )
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+                    t_split_microbatch += time.perf_counter() - t0
 
                 self.actor_optimizer.zero_grad()
 
@@ -578,9 +589,11 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_scale_factor = 1 / self.gradient_accumulation
 
                     # all return: (bsz, response_length)
+                    t0 = time.perf_counter()
                     outputs = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
+                    t_forward_micro += time.perf_counter() - t0
                     log_prob = outputs["log_probs"]
                     entropy = outputs["entropys"] if calculate_entropy else None
 
@@ -654,16 +667,25 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * loss_scale_factor
                     else:
                         loss = policy_loss * loss_scale_factor
+                    t0 = time.perf_counter()
                     if self.scaler is not None:
                         self.scaler.scale(loss).backward()
                     else:
                         loss.backward()
+                    t_backward_micro += time.perf_counter() - t0
 
                     metrics["actor/pg_loss"] += pg_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)
 
+                t0 = time.perf_counter()
                 grad_norm = self._optimizer_step()
+                t_optimizer_step += time.perf_counter() - t0
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
+        metrics["timing_s/actor_update_split_minibatch"] = float(t_split_minibatch)
+        metrics["timing_s/actor_update_split_microbatch"] = float(t_split_microbatch)
+        metrics["timing_s/actor_update_forward_micro"] = float(t_forward_micro)
+        metrics["timing_s/actor_update_backward_micro"] = float(t_backward_micro)
+        metrics["timing_s/actor_update_optimizer_step"] = float(t_optimizer_step)
         self.actor_optimizer.zero_grad()
         return metrics

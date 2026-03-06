@@ -19,6 +19,7 @@ import datetime
 import json
 import logging
 import os
+import time
 import warnings
 from dataclasses import asdict
 from typing import Any, Optional
@@ -913,10 +914,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
         assert self._is_actor
+        load_start = time.perf_counter()
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
         if self._is_offload_optimizer:
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
+        load_elapsed = time.perf_counter() - load_start
 
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
@@ -936,6 +939,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
             metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
             metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+            metrics["timing_s/actor_update_load_state"] = float(load_elapsed)
+            metrics["timing_s/actor_update_policy_compute"] = float(delta_time)
 
             lr = self.actor_lr_scheduler.get_last_lr()[0]
             metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
@@ -946,12 +951,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             output = output.to("cpu")
 
+        offload_start = time.perf_counter()
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+        output.meta_info["metrics"]["timing_s/actor_update_offload_state"] = float(time.perf_counter() - offload_start)
 
         return output
 
@@ -1021,13 +1028,22 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
         # we should always recompute old_log_probs when it is HybridEngine
         config_source = self.config.ref if is_lora else self.config.rollout
-        data.meta_info["micro_batch_size"] = config_source.log_prob_micro_batch_size_per_gpu
+        micro_batch_size_override = data.meta_info.pop("log_prob_micro_batch_size_override", None)
+        if micro_batch_size_override is not None:
+            micro_batch_size_override = int(micro_batch_size_override)
+            if micro_batch_size_override <= 0:
+                raise ValueError("log_prob_micro_batch_size_override must be > 0.")
+        data.meta_info["micro_batch_size"] = (
+            micro_batch_size_override
+            if micro_batch_size_override is not None
+            else config_source.log_prob_micro_batch_size_per_gpu
+        )
         data.meta_info["max_token_len"] = config_source.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = config_source.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
         data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
         # perform recompute log_prob
-        calculate_entropy = not is_lora
+        calculate_entropy = bool(data.meta_info.pop("calculate_entropy", not is_lora)) and (not is_lora)
         with self.ulysses_sharding_manager:
             with adapter_ctx:
                 outputs = self.actor.compute_log_prob(data=data, calculate_entropy=calculate_entropy)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Optional
@@ -23,6 +24,16 @@ class QueryGroup:
     group_size: int = -1
     last_training_step: int = -1
     insertion_order: int = -1
+    # Cached ZVP statistics for replay prioritization.
+    zvp_score: float = 0.0
+    zvp_mean_surprisal: float = 0.0
+    # Fraction of negative-advantage tokens within response tokens.
+    zvp_neg_frac: float = 0.0
+    # Deprecated legacy field retained for checkpoint compatibility.
+    zvp_mean_pos_adv: float = 0.0
+    zvp_pos_frac: float = 0.0
+    zvp_last_update_step: int = -1
+    zvp_update_count: int = 0
 
 
 @dataclass
@@ -107,6 +118,74 @@ class QueryGroupReplayBuffer:
                 group.success_count = -1
             if not hasattr(group, "group_size"):
                 group.group_size = -1
+            if not hasattr(group, "zvp_score"):
+                group.zvp_score = 0.0
+            if not hasattr(group, "zvp_mean_surprisal"):
+                group.zvp_mean_surprisal = 0.0
+            if not hasattr(group, "zvp_neg_frac"):
+                # Legacy snapshots may store sign-only third term in zvp_mean_pos_adv.
+                group.zvp_neg_frac = float(getattr(group, "zvp_mean_pos_adv", 0.0))
+            if not hasattr(group, "zvp_mean_pos_adv"):
+                group.zvp_mean_pos_adv = 0.0
+            if not hasattr(group, "zvp_pos_frac"):
+                group.zvp_pos_frac = 0.0
+            if not hasattr(group, "zvp_last_update_step"):
+                group.zvp_last_update_step = int(getattr(group, "insertion_step", 0))
+            if not hasattr(group, "zvp_update_count"):
+                group.zvp_update_count = 0
+
+
+def compute_group_zvp_stats(
+    log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    adv_pos_eps: float = 1e-8,
+    lambda_neg: float = 1.0,
+) -> tuple[float, float, float, float]:
+    """Compute ZVP statistics from token log-probs and advantages.
+
+    Sign-only symmetric score (project-specific):
+    - Positive-advantage tokens: reward low token probability (1 - p).
+    - Negative-advantage tokens: reward high token probability (p).
+    - Advantage magnitude is intentionally ignored.
+    - Uses bounded token terms in [0, 1] without per-group min-max scaling.
+    """
+    if log_probs.shape != advantages.shape or log_probs.shape != response_mask.shape:
+        raise ValueError(
+            f"Shape mismatch in ZVP stats: {log_probs.shape=}, {advantages.shape=}, {response_mask.shape=}"
+        )
+
+    mask = response_mask.bool()
+    if not torch.any(mask):
+        return (0.0, 0.0, 0.0, 0.0)
+
+    adv = advantages.float()
+    surprisal = (-log_probs.float()).clamp_min(0.0)
+    probs = torch.exp(-surprisal).clamp(0.0, 1.0)
+
+    pos_mask = mask & (adv > float(adv_pos_eps))
+    neg_mask = mask & (adv < -float(adv_pos_eps))
+    pos_count = int(pos_mask.sum().item())
+    neg_count = int(neg_mask.sum().item())
+    total_count = int(mask.sum().item())
+    if total_count <= 0:
+        return (0.0, 0.0, 0.0, 0.0)
+
+    pos_term = torch.zeros_like(probs)
+    neg_term = torch.zeros_like(probs)
+    if pos_count > 0:
+        pos_term[pos_mask] = 1.0 - probs[pos_mask]
+    if neg_count > 0:
+        neg_term[neg_mask] = probs[neg_mask]
+
+    token_score = pos_term + float(lambda_neg) * neg_term
+    score = float(token_score[mask].mean().item())
+
+    mean_surprisal = float(surprisal[mask].mean().item())
+    pos_frac = float(pos_count / total_count)
+    neg_frac = float(neg_count / total_count)
+    # Keep tuple shape stable: third item stores neg_frac in sign-only mode.
+    return (score, mean_surprisal, neg_frac, pos_frac)
 
 
 def _stable_seed_rank(query_id: str, seed: int) -> int:
@@ -122,6 +201,8 @@ def _candidate_sort_key(
     selection_mode: str,
     recency_beta: float,
     recency_decay_lambda: float,
+    zvp_weight: float,
+    zvp_use_recency: bool,
 ) -> tuple[float, int, int]:
     priority_score, _, _, _, _ = _priority_terms(
         group=group,
@@ -129,6 +210,8 @@ def _candidate_sort_key(
         selection_mode=selection_mode,
         recency_beta=recency_beta,
         recency_decay_lambda=recency_decay_lambda,
+        zvp_weight=zvp_weight,
+        zvp_use_recency=zvp_use_recency,
     )
     seed_rank = _stable_seed_rank(group.query_id, seed)
     insertion_order = int(group.insertion_order)
@@ -141,6 +224,8 @@ def _priority_terms(
     selection_mode: str,
     recency_beta: float,
     recency_decay_lambda: float,
+    zvp_weight: float,
+    zvp_use_recency: bool,
 ) -> tuple[float, float, float, int, int]:
     last_training_step = int(group.last_training_step)
     if last_training_step < 0:
@@ -151,6 +236,16 @@ def _priority_terms(
         priority_score = float(last_training_step)
         uncertainty = 0.0
         recency_value = float(last_training_step)
+    elif selection_mode == "zvp_recency":
+        # Lower score is selected first, so negate ZVP term.
+        zvp_term = max(float(group.zvp_score), 0.0)
+        if zvp_use_recency:
+            decay_lambda = max(float(recency_decay_lambda), 1e-6)
+            recency_value = float(recency_beta) * math.exp(-float(age) / decay_lambda)
+        else:
+            recency_value = 0.0
+        priority_score = -float(zvp_weight) * zvp_term + recency_value
+        uncertainty = 0.0
     else:
         uncertainty = 2.0 * abs(float(group.success_prob) - 0.5)
         decay_lambda = max(float(recency_decay_lambda), 1e-6)
@@ -182,11 +277,19 @@ def select_replay_groups(
     target_groups: int,
     tau: float,
     compute_new_log_probs_fn: Callable[[DataProto], torch.Tensor],
+    compute_new_log_probs_batch_fn: Optional[Callable[[list[DataProto]], list[torch.Tensor]]] = None,
     max_scan: Optional[int] = None,
     current_step: int = 0,
     selection_mode: str = "legacy_uncertainty_recency",
     recency_beta: float = 1.0,
     recency_decay_lambda: float = 4.0,
+    zvp_weight: float = 1.0,
+    adv_pos_eps: float = 1e-8,
+    zvp_lambda_neg: float = 1.0,
+    zvp_use_recency: bool = True,
+    groups_per_chunk: int = 1,
+    build_candidate_priority_all: bool = True,
+    timing_raw: Optional[dict[str, float]] = None,
 ) -> ReplaySelectionResult:
     if target_groups <= 0 or len(buffer) == 0:
         return ReplaySelectionResult(
@@ -200,8 +303,9 @@ def select_replay_groups(
 
     candidates = buffer.items()
     normalized_mode = str(selection_mode).strip().lower()
-    if normalized_mode not in {"legacy_uncertainty_recency", "recency_only"}:
+    if normalized_mode not in {"legacy_uncertainty_recency", "recency_only", "zvp_recency"}:
         normalized_mode = "legacy_uncertainty_recency"
+    t0 = time.perf_counter()
     candidates = sorted(
         candidates,
         key=lambda group: _candidate_sort_key(
@@ -211,32 +315,53 @@ def select_replay_groups(
             selection_mode=normalized_mode,
             recency_beta=recency_beta,
             recency_decay_lambda=recency_decay_lambda,
+            zvp_weight=zvp_weight,
+            zvp_use_recency=zvp_use_recency,
         ),
     )
+    if timing_raw is not None:
+        timing_raw["m2_select_sort_candidates"] = timing_raw.get("m2_select_sort_candidates", 0.0) + (
+            time.perf_counter() - t0
+        )
     scan_limit = len(candidates) if max_scan is None else min(len(candidates), int(max_scan))
-    candidate_priority_all: list[dict[str, object]] = []
-    for group in candidates:
+    def _build_priority_entry(group: QueryGroup) -> dict[str, object]:
         priority_score, uncertainty, recency_value, age, last_training_step = _priority_terms(
             group=group,
             current_step=current_step,
             selection_mode=normalized_mode,
             recency_beta=recency_beta,
             recency_decay_lambda=recency_decay_lambda,
+            zvp_weight=zvp_weight,
+            zvp_use_recency=zvp_use_recency,
         )
-        candidate_priority_all.append(
-            {
-                "query_id": group.query_id,
-                "score": priority_score,
-                "uncertainty": uncertainty,
-                "recency_value": recency_value,
-                "age": age,
-                "last_training_step": last_training_step,
-                "success_prob": float(group.success_prob),
-                "success_count": int(group.success_count),
-                "group_size": int(group.group_size),
-            }
+        return {
+            "query_id": group.query_id,
+            "score": priority_score,
+            "uncertainty": uncertainty,
+            "recency_value": recency_value,
+            "age": age,
+            "last_training_step": last_training_step,
+            "success_prob": float(group.success_prob),
+            "success_count": int(group.success_count),
+            "group_size": int(group.group_size),
+            "zvp_score": float(group.zvp_score),
+            "zvp_mean_surprisal": float(group.zvp_mean_surprisal),
+            "zvp_neg_frac": float(group.zvp_neg_frac),
+            "zvp_pos_frac": float(group.zvp_pos_frac),
+            "zvp_use_recency": bool(zvp_use_recency),
+        }
+
+    candidate_priority_all: list[dict[str, object]] = []
+    t0 = time.perf_counter()
+    if build_candidate_priority_all:
+        candidate_priority_all = [_build_priority_entry(group) for group in candidates]
+        candidate_priority_preview = candidate_priority_all[:10]
+    else:
+        candidate_priority_preview = [_build_priority_entry(group) for group in candidates[:10]]
+    if timing_raw is not None:
+        timing_raw["m2_select_build_priority"] = timing_raw.get("m2_select_build_priority", 0.0) + (
+            time.perf_counter() - t0
         )
-    candidate_priority_preview = candidate_priority_all[:10]
 
     selected: list[QueryGroup] = []
     accepted_m2: list[float] = []
@@ -246,26 +371,32 @@ def select_replay_groups(
     rejected_eval_error = 0
     scanned_groups = 0
 
-    for group in candidates[:scan_limit]:
-        if len(selected) >= target_groups:
-            break
-        scanned_groups += 1
-
-        required = {"old_log_probs", "response_mask"}
-        if group.data.batch is None or not required.issubset(set(group.data.batch.keys())):
-            rejected_missing_fields += 1
-            continue
-
-        try:
-            old_log_probs = group.data.batch["old_log_probs"]
-            response_mask = group.data.batch["response_mask"]
-            new_log_probs = compute_new_log_probs_fn(group.data)
-            m2 = compute_group_m2(old_log_probs=old_log_probs, new_log_probs=new_log_probs, response_mask=response_mask)
-        except Exception:
-            rejected_eval_error += 1
-            continue
+    def _accept_if_passing_tau(group: QueryGroup, new_log_probs: torch.Tensor) -> None:
+        nonlocal rejected_by_tau
+        t0 = time.perf_counter()
+        old_log_probs = group.data.batch["old_log_probs"]
+        response_mask = group.data.batch["response_mask"]
+        m2 = compute_group_m2(old_log_probs=old_log_probs, new_log_probs=new_log_probs, response_mask=response_mask)
 
         if m2 <= tau:
+            runtime_zvp_score = 0.0
+            runtime_zvp_mean_surprisal = 0.0
+            runtime_zvp_neg_frac = 0.0
+            runtime_zvp_pos_frac = 0.0
+            if "advantages" in group.data.batch.keys():
+                (
+                    runtime_zvp_score,
+                    runtime_zvp_mean_surprisal,
+                    runtime_zvp_neg_frac,
+                    runtime_zvp_pos_frac,
+                ) = compute_group_zvp_stats(
+                    log_probs=new_log_probs,
+                    advantages=group.data.batch["advantages"],
+                    response_mask=response_mask,
+                    adv_pos_eps=adv_pos_eps,
+                    lambda_neg=zvp_lambda_neg,
+                )
+
             selected.append(group)
             accepted_m2.append(m2)
             priority_score, uncertainty, recency_value, age, last_training_step = _priority_terms(
@@ -274,6 +405,8 @@ def select_replay_groups(
                 selection_mode=normalized_mode,
                 recency_beta=recency_beta,
                 recency_decay_lambda=recency_decay_lambda,
+                zvp_weight=zvp_weight,
+                zvp_use_recency=zvp_use_recency,
             )
             selected_priority_debug.append(
                 {
@@ -287,10 +420,106 @@ def select_replay_groups(
                     "success_count": int(group.success_count),
                     "group_size": int(group.group_size),
                     "m2": float(m2),
+                    "zvp_score": float(group.zvp_score),
+                    "zvp_runtime_score": float(runtime_zvp_score),
+                    "zvp_runtime_mean_surprisal": float(runtime_zvp_mean_surprisal),
+                    "zvp_runtime_neg_frac": float(runtime_zvp_neg_frac),
+                    "zvp_runtime_pos_frac": float(runtime_zvp_pos_frac),
                 }
             )
         else:
             rejected_by_tau += 1
+        if timing_raw is not None:
+            timing_raw["m2_select_m2_eval"] = timing_raw.get("m2_select_m2_eval", 0.0) + (time.perf_counter() - t0)
+
+    scan_candidates = candidates[:scan_limit]
+    use_chunked_logprob = (
+        compute_new_log_probs_batch_fn is not None
+        and int(groups_per_chunk) > 1
+    )
+
+    loop_start = time.perf_counter()
+    if not use_chunked_logprob:
+        for group in scan_candidates:
+            if len(selected) >= target_groups:
+                break
+            scanned_groups += 1
+
+            required = {"old_log_probs", "response_mask"}
+            if group.data.batch is None or not required.issubset(set(group.data.batch.keys())):
+                rejected_missing_fields += 1
+                continue
+
+            try:
+                t0 = time.perf_counter()
+                new_log_probs = compute_new_log_probs_fn(group.data)
+                if timing_raw is not None:
+                    timing_raw["m2_select_logprob_eval"] = timing_raw.get("m2_select_logprob_eval", 0.0) + (
+                        time.perf_counter() - t0
+                    )
+                _accept_if_passing_tau(group, new_log_probs)
+            except Exception:
+                rejected_eval_error += 1
+                continue
+    else:
+        chunk_size = max(int(groups_per_chunk), 1)
+        for chunk_start in range(0, len(scan_candidates), chunk_size):
+            if len(selected) >= target_groups:
+                break
+            chunk = scan_candidates[chunk_start : chunk_start + chunk_size]
+
+            valid_groups: list[QueryGroup] = []
+            for group in chunk:
+                scanned_groups += 1
+                required = {"old_log_probs", "response_mask"}
+                if group.data.batch is None or not required.issubset(set(group.data.batch.keys())):
+                    rejected_missing_fields += 1
+                    continue
+                valid_groups.append(group)
+
+            if not valid_groups:
+                continue
+
+            try:
+                t0 = time.perf_counter()
+                new_log_probs_list = compute_new_log_probs_batch_fn([group.data for group in valid_groups])
+                if timing_raw is not None:
+                    timing_raw["m2_select_logprob_eval"] = timing_raw.get("m2_select_logprob_eval", 0.0) + (
+                        time.perf_counter() - t0
+                    )
+                if len(new_log_probs_list) != len(valid_groups):
+                    raise ValueError(
+                        "compute_new_log_probs_batch_fn must return one tensor per group, "
+                        f"got {len(new_log_probs_list)} for {len(valid_groups)} groups."
+                    )
+            except Exception:
+                # Fallback to per-group evaluation to preserve correctness.
+                for group in valid_groups:
+                    if len(selected) >= target_groups:
+                        break
+                    try:
+                        t0 = time.perf_counter()
+                        new_log_probs = compute_new_log_probs_fn(group.data)
+                        if timing_raw is not None:
+                            timing_raw["m2_select_logprob_eval"] = timing_raw.get("m2_select_logprob_eval", 0.0) + (
+                                time.perf_counter() - t0
+                            )
+                        _accept_if_passing_tau(group, new_log_probs)
+                    except Exception:
+                        rejected_eval_error += 1
+                continue
+
+            for group, new_log_probs in zip(valid_groups, new_log_probs_list, strict=True):
+                if len(selected) >= target_groups:
+                    break
+                try:
+                    _accept_if_passing_tau(group, new_log_probs)
+                except Exception:
+                    rejected_eval_error += 1
+    if timing_raw is not None:
+        timing_raw["m2_select_scan_loop"] = timing_raw.get("m2_select_scan_loop", 0.0) + (
+            time.perf_counter() - loop_start
+        )
 
     return ReplaySelectionResult(
         selected_groups=selected,

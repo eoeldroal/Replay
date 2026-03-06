@@ -109,6 +109,9 @@ class SearchTool(BaseTool):
         self.rate_limit = config.get("rate_limit", 120)
         self._rate_limiter = _get_global_rate_limiter(self.rate_limit)
 
+        # Per-instance data from create_kwargs (row_index, document_images)
+        self._instance_data: dict[str, dict] = {}
+
         # Image path setup
         self.project_root = os.path.dirname(
             os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -124,25 +127,33 @@ class SearchTool(BaseTool):
             f"rate_limit={self.rate_limit}, image_root={self.local_image_root}"
         )
 
+    async def create(self, instance_id: Optional[str] = None, **kwargs) -> tuple:
+        """Store create_kwargs (row_index, document_images) for this instance."""
+        if instance_id is None:
+            instance_id = str(uuid.uuid4())
+        create_kwargs = kwargs.get("create_kwargs", {})
+        self._instance_data[instance_id] = {
+            "row_index": create_kwargs.get("row_index"),
+            "document_images": create_kwargs.get("document_images", []),
+        }
+        return instance_id, ToolResponse()
+
     async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> ToolResponse:
         agent_data = kwargs.get('agent_data')
         query = parameters.get('query')
 
-        # Extract sample_id (required for search server)
-        sample_id = None
-        if agent_data and hasattr(agent_data, 'sample_id'):
-            sample_id = agent_data.sample_id
+        # Get per-instance data (row_index, document_images) stored by create()
+        inst = self._instance_data.get(instance_id, {})
+        row_index = inst.get("row_index")
+        document_images = inst.get("document_images", [])
 
-        if sample_id is None:
-            error_msg = (
-                "CRITICAL: sample_id is None! "
-                "Check: 1) ray_trainer.py uid assignment, 2) tool_agent_loop.py kwargs extraction"
-            )
-            logger.error(error_msg)
-            raise ValueError(error_msg)
+        if row_index is None:
+            logger.warning(f"row_index is None for instance {instance_id}, falling back to sample_id")
+            sample_id = agent_data.sample_id if agent_data and hasattr(agent_data, 'sample_id') else None
+            if sample_id is None:
+                return ToolResponse(text="Error: No row_index or sample_id available.")
 
-        numeric_id = sample_id.split("_")[-1] if sample_id else None
-        payload = [{"query": query, "request_idx": 0, "id": numeric_id}]
+        payload = [{"query": query, "request_idx": 0, "row_index": row_index}]
 
         # HTTP search in a thread with process-global concurrency limit.
         try:
@@ -159,55 +170,68 @@ class SearchTool(BaseTool):
         if error_msg or response_json is None:
             return ToolResponse(text=f"Error: {error_msg or 'No response from search server.'}")
 
-        # ② Process results + load images locally (needs agent_data)
+        # ② Process results: resolve position indices to relative doc_id paths
         text_content = "No search results found."
         images_found = []
         image_paths_found = []
         selected_rank: Optional[int] = None
-        selected_server_idx: Optional[int] = None
-        selected_image_name: Optional[str] = None
+        selected_position: Optional[int] = None
+        selected_doc_id: Optional[str] = None
 
         if isinstance(response_json, list) and len(response_json) > 0:
             search_result = response_json[0]
 
             if isinstance(search_result, dict) and 'results' in search_result:
-                candidates = self._normalize_candidates(search_result['results'])
                 existing_image_paths = set()
                 if agent_data:
                     existing_image_paths = set(agent_data.extra_fields.get('image_paths', []))
 
-                for rank0, item in enumerate(candidates):
-                    image_path = item.get('image_file')
-                    if not image_path:
+                for rank0, item in enumerate(search_result['results']):
+                    # Server returns position index (0-19) within the deck
+                    position = item.get('position') if isinstance(item, dict) else None
+                    if position is None:
+                        continue
+                    try:
+                        position = int(position)
+                    except (TypeError, ValueError):
+                        continue
+                    if position < 0 or position >= len(document_images):
+                        logger.warning(f"Position {position} out of range [0, {len(document_images)})")
                         continue
 
-                    final_path = self._resolve_local_image_path(image_path)
+                    # Resolve position to relative doc_id path
+                    doc_id = document_images[position]
 
-                    if final_path in existing_image_paths:
+                    if doc_id in existing_image_paths:
                         continue
 
-                    if os.path.exists(final_path):
+                    # Load image from local filesystem for model consumption
+                    local_path = os.path.join(self.local_image_root, doc_id)
+                    if os.path.exists(local_path):
                         try:
-                            img_obj = Image.open(final_path).convert("RGB")
+                            img_obj = Image.open(local_path).convert("RGB")
                             images_found.append(img_obj)
-                            image_paths_found.append(final_path)
+                            # Store relative doc_id (matches reference_documents format for NDCG)
+                            image_paths_found.append(doc_id)
                             selected_rank = rank0 + 1
-                            selected_server_idx = item.get("idx")
-                            selected_image_name = os.path.basename(final_path)
+                            selected_position = position
+                            selected_doc_id = doc_id
                             break  # 첫 번째 유효 이미지만
                         except Exception as e:
-                            logger.warning(f"Failed to load image {final_path}: {e}")
+                            logger.warning(f"Failed to load image {local_path}: {e}")
+                    else:
+                        logger.warning(f"Image not found: {local_path}")
 
                 text_content = self._format_results(
                     search_result,
                     selected_rank=selected_rank,
-                    selected_server_idx=selected_server_idx,
-                    selected_image_name=selected_image_name,
+                    selected_position=selected_position,
+                    selected_doc_id=selected_doc_id,
                 )
             else:
                 text_content = self._format_results(search_result)
 
-        # Update agent_data with loaded image paths
+        # Update agent_data with relative doc_id paths
         if agent_data and image_paths_found:
             if 'image_paths' not in agent_data.extra_fields:
                 agent_data.extra_fields['image_paths'] = []
@@ -248,33 +272,39 @@ class SearchTool(BaseTool):
         self,
         result_data: Any,
         selected_rank: Optional[int] = None,
-        selected_server_idx: Optional[int] = None,
-        selected_image_name: Optional[str] = None,
+        selected_position: Optional[int] = None,
+        selected_doc_id: Optional[str] = None,
     ) -> str:
         """Format search results for model consumption."""
         if isinstance(result_data, dict) and 'results' in result_data:
-            candidates = self._normalize_candidates(result_data['results'])
-            if not candidates:
+            results = result_data['results']
+            if not results:
                 return "No search results found."
 
             snippets = []
             if selected_rank is not None:
                 selected_msg = f"Selected image: rank={selected_rank}"
-                if selected_server_idx is not None:
-                    selected_msg += f", idx={selected_server_idx}"
-                if selected_image_name:
-                    selected_msg += f", file={selected_image_name}"
+                if selected_position is not None:
+                    selected_msg += f", position={selected_position}"
+                if selected_doc_id:
+                    selected_msg += f", doc={selected_doc_id}"
                 snippets.append(selected_msg)
             else:
                 snippets.append("Selected image: none (all candidates were previously used or missing locally).")
 
             snippets.append("Top candidates:")
-            for rank0, item in enumerate(candidates[:self.k]):
-                image_name = os.path.basename(item.get("image_file", ""))
-                score = item.get("score")
-                line = f"[rank={rank0+1}] idx={item.get('idx')} file={image_name}"
-                if score is not None:
-                    line += f" score={score:.4f}"
+            for rank0, item in enumerate(results[:self.k]):
+                if isinstance(item, dict):
+                    position = item.get("position", "?")
+                    score = item.get("score")
+                    line = f"[rank={rank0+1}] position={position}"
+                    if score is not None:
+                        try:
+                            line += f" score={float(score):.4f}"
+                        except (TypeError, ValueError):
+                            line += f" score={score}"
+                else:
+                    line = f"[rank={rank0+1}] {item}"
                 snippets.append(line)
             return "\n".join(snippets)
         return str(result_data)

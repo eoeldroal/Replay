@@ -855,7 +855,16 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         adapter_ctx = self.peft_cls.disable_adapter(self.actor_module) if is_lora else nullcontext()
         # we should always recompute old_log_probs when it is HybridEngine
         config_source = self.config.ref if is_lora else self.config.rollout
-        data.meta_info["micro_batch_size"] = config_source.log_prob_micro_batch_size_per_gpu
+        micro_batch_size_override = data.meta_info.pop("log_prob_micro_batch_size_override", None)
+        if micro_batch_size_override is not None:
+            micro_batch_size_override = int(micro_batch_size_override)
+            if micro_batch_size_override <= 0:
+                raise ValueError("log_prob_micro_batch_size_override must be > 0.")
+        data.meta_info["micro_batch_size"] = (
+            micro_batch_size_override
+            if micro_batch_size_override is not None
+            else config_source.log_prob_micro_batch_size_per_gpu
+        )
         data.meta_info["max_token_len"] = config_source.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = config_source.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
@@ -866,10 +875,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self.enable_routing_replay and self.config.actor.router_replay.mode == "R3":
             RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
 
+        calculate_entropy = bool(data.meta_info.pop("calculate_entropy", not is_lora)) and (not is_lora)
         with adapter_ctx:
-            output, entropys, layers_topk_idx = self.actor.compute_log_prob(data=data, calculate_entropy=not is_lora)
+            output, entropys, layers_topk_idx = self.actor.compute_log_prob(data=data, calculate_entropy=calculate_entropy)
         tensors = {"ref_log_prob": output} if is_lora else {"old_log_probs": output}
-        if not is_lora:
+        if calculate_entropy:
             tensors["entropys"] = entropys
         output = DataProto.from_dict(
             tensors=tensors,

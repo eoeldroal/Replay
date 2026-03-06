@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 project_name=m2-replay-exp
-experiment_name=grpo-qwen25-math-1.5b-s8-m2-replay-rev3
+experiment_name=grpo-qwen25-math-1.5b-s8-m2-replay-rev2-r256
 
 deepscaler_preview_train_path="$ROOT_DIR/data/deepscaler_preview/train.parquet"
 train_files="['$deepscaler_preview_train_path']"
@@ -13,10 +13,7 @@ train_files="['$deepscaler_preview_train_path']"
 math500_test_path="$ROOT_DIR/data/math500/test.parquet"
 aime2024_test_path="$ROOT_DIR/data/aime2024x4/test.parquet"
 aime2025_test_path="$ROOT_DIR/data/aime2025x4/test.parquet"
-minerva_test_path="$ROOT_DIR/data/minerva/test.parquet"
-amc23_test_path="$ROOT_DIR/data/amc23/test.parquet"
-olympiadbench_test_path="$ROOT_DIR/data/olympiadbench/test.parquet"
-test_files="['$math500_test_path', '$aime2024_test_path', '$aime2025_test_path', '$minerva_test_path', '$amc23_test_path', '$olympiadbench_test_path']"
+test_files="['$math500_test_path', '$aime2024_test_path', '$aime2025_test_path']"
 
 model_path="$ROOT_DIR/data/models/Qwen2.5-Math-1.5B"
 log_dir="$ROOT_DIR/data-log/$project_name/$experiment_name"
@@ -64,9 +61,8 @@ python3 -u -m verl.trainer.main_ppo \
     algorithm.use_kl_in_reward=False \
     +algorithm.m2_replay.enable=true \
     +algorithm.m2_replay.tau=0.001 \
-    +algorithm.m2_replay.buffer.max_query_groups=2048 \
-    +algorithm.m2_replay.training_mode=fixed_total_with_adv0_drop \
-    +algorithm.m2_replay.schedule.fixed_total_groups=256 \
+    +algorithm.m2_replay.buffer.max_query_groups=1024 \
+    +algorithm.m2_replay.schedule.replay_target_groups=256 \
     +algorithm.m2_replay.selection.mode=recency_only \
     +algorithm.m2_replay.selection.ingress_filter_mode=rlvr_halfband \
     +algorithm.m2_replay.schedule.floor_to_micro_multiple=true \

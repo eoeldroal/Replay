@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from verl import DataProto
-from verl.trainer.ppo.m2_replay import QueryGroup
+from verl.trainer.ppo.m2_replay import QueryGroup, compute_group_zvp_stats
 
 # Minimal actor training keys.
 ACTOR_BATCH_KEYS = [
@@ -106,6 +106,7 @@ def build_query_groups_from_onpolicy_batch(
     insertion_step: int,
     success_count_min: Optional[int] = None,
     success_count_max: Optional[int] = None,
+    zvp_lambda_neg: float = 1.0,
 ) -> GroupBuildResult:
     if "uid" not in batch.non_tensor_batch:
         return GroupBuildResult(
@@ -170,6 +171,24 @@ def build_query_groups_from_onpolicy_batch(
                 last_training_step=int(insertion_step),
             )
         )
+        # Initialize ZVP cache from current on-policy snapshot.
+        if actor_group.batch is not None and {"old_log_probs", "advantages", "response_mask"}.issubset(
+            set(actor_group.batch.keys())
+        ):
+            zvp_score, mean_surprisal, neg_frac, pos_frac = compute_group_zvp_stats(
+                log_probs=actor_group.batch["old_log_probs"],
+                advantages=actor_group.batch["advantages"],
+                response_mask=actor_group.batch["response_mask"],
+                lambda_neg=zvp_lambda_neg,
+            )
+            groups[-1].zvp_score = float(zvp_score)
+            groups[-1].zvp_mean_surprisal = float(mean_surprisal)
+            groups[-1].zvp_neg_frac = float(neg_frac)
+            groups[-1].zvp_pos_frac = float(pos_frac)
+            groups[-1].zvp_last_update_step = int(insertion_step)
+            groups[-1].zvp_update_count = 1
+
+        # Keep group build payload format stable.
         debug_entry["status"] = "accepted"
         group_debug_all.append(debug_entry)
 

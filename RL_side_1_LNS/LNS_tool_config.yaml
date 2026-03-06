@@ -3,11 +3,11 @@ tools:
     class_name: verl.tools.LNS.search_tool.SearchTool 
     config:
       type: native
-      retrieval_service_url: http://163.239.28.21:5002/search
+      retrieval_service_url: http://127.0.0.1:10001/search
       timeout: 30
       num_workers: 120
       rate_limit: 120
-      local_image_root: ./LNS/corpus/img
+      local_image_root: ./data/Visual_Document_Rag/VDR_final/corpus/img
     tool_schema:
       type: function
       function:

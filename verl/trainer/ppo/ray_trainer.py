@@ -50,7 +50,12 @@ from verl.trainer.ppo.metric_utils import (
     compute_variance_proxy_metrics,
     process_validation_metrics,
 )
-from verl.trainer.ppo.m2_replay import QueryGroupReplayBuffer, derive_micro_group_multiple, select_replay_groups
+from verl.trainer.ppo.m2_replay import (
+    QueryGroupReplayBuffer,
+    ReplaySelectionResult,
+    derive_micro_group_multiple,
+    select_replay_groups,
+)
 from verl.trainer.ppo.m2_replay_adapter import (
     build_actor_batch_from_groups,
     build_actor_batch_with_replay,
@@ -382,11 +387,19 @@ class RayPPOTrainer:
         self.m2_replay_replay_target_groups: Optional[int] = None
         self.m2_replay_recent_learning_beta = 1.0
         self.m2_replay_recent_learning_decay_lambda = 4.0
+        self.m2_replay_zvp_weight = 1.0
+        self.m2_replay_zvp_ema_alpha = 0.5
+        self.m2_replay_zvp_adv_pos_eps = 1e-8
+        self.m2_replay_zvp_lambda_neg = 1.0
+        self.m2_replay_zvp_use_recency = True
+        self.m2_replay_logprob_groups_per_chunk = 1
+        self.m2_replay_log_prob_micro_batch_size_per_gpu: Optional[int] = None
         self.m2_replay_dump_full_scores = False
         self.m2_replay_full_scores_dir: Optional[str] = None
         self.m2_replay_training_mode = "legacy_bonus"
         self.m2_replay_fixed_total_groups = 0
         self.m2_replay_fixed_total_floor_groups = 0
+        self.m2_replay_one_turnover_gate = False
         self.m2_replay_adv_zero_eps = 1e-8
         self.m2_replay_buffer: Optional[QueryGroupReplayBuffer] = None
         self.m2_replay_query_use_count: dict[str, int] = defaultdict(int)
@@ -424,6 +437,23 @@ class RayPPOTrainer:
             self.m2_replay_recent_learning_decay_lambda = float(
                 selection_cfg.get("recent_learning_decay_lambda", 4.0)
             )
+            self.m2_replay_zvp_weight = float(selection_cfg.get("zvp_weight", 1.0))
+            zvp_ema_alpha = float(selection_cfg.get("zvp_ema_alpha", 0.5))
+            self.m2_replay_zvp_ema_alpha = max(0.0, min(1.0, zvp_ema_alpha))
+            self.m2_replay_zvp_adv_pos_eps = max(float(selection_cfg.get("zvp_adv_pos_eps", 1e-8)), 0.0)
+            self.m2_replay_zvp_lambda_neg = max(float(selection_cfg.get("zvp_lambda_neg", 1.0)), 0.0)
+            self.m2_replay_zvp_use_recency = bool(selection_cfg.get("zvp_use_recency", True))
+            self.m2_replay_logprob_groups_per_chunk = max(int(selection_cfg.get("logprob_groups_per_chunk", 1)), 1)
+            log_prob_micro_batch_size_cfg = selection_cfg.get("log_prob_micro_batch_size_per_gpu", None)
+            if log_prob_micro_batch_size_cfg is None:
+                self.m2_replay_log_prob_micro_batch_size_per_gpu = None
+            else:
+                parsed_log_prob_micro_batch_size = int(log_prob_micro_batch_size_cfg)
+                if parsed_log_prob_micro_batch_size <= 0:
+                    raise ValueError(
+                        "[m2_replay] selection.log_prob_micro_batch_size_per_gpu must be > 0 when provided."
+                    )
+                self.m2_replay_log_prob_micro_batch_size_per_gpu = parsed_log_prob_micro_batch_size
             training_mode_raw = str(self.m2_replay_cfg.get("training_mode", "legacy_bonus")).strip().lower()
             valid_training_modes = {"legacy_bonus", "fixed_total_with_adv0_drop"}
             if training_mode_raw not in valid_training_modes:
@@ -447,6 +477,7 @@ class RayPPOTrainer:
                     flush=True,
                 )
                 self.m2_replay_fixed_total_floor_groups = 0
+            self.m2_replay_one_turnover_gate = bool(schedule_cfg.get("one_turnover_gate", False))
             self.m2_replay_prefix = str(logging_cfg.get("prefix", "m2_replay"))
             self.m2_replay_dump_full_scores = bool(logging_cfg.get("dump_full_scores", True))
             custom_full_scores_dir = logging_cfg.get("full_scores_dir", None)
@@ -1415,7 +1446,12 @@ class RayPPOTrainer:
 
         return ref_log_prob
 
-    def _compute_old_log_prob(self, batch: DataProto):
+    def _compute_old_log_prob(
+        self,
+        batch: DataProto,
+        calculate_entropy: bool = True,
+        log_prob_micro_batch_size_override: Optional[int] = None,
+    ):
         if self.use_legacy_worker_impl == "disable":
             # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
             # step 1: convert dataproto to tensordict.
@@ -1423,19 +1459,29 @@ class RayPPOTrainer:
             # step 2: convert from padding to nopadding
             batch_td = left_right_2_no_padding(batch_td)
             # step 3: add meta info
-            tu.assign_non_tensor(batch_td, calculate_entropy=True, compute_loss=False)
+            assign_kwargs: dict[str, object] = {"calculate_entropy": calculate_entropy, "compute_loss": False}
+            if log_prob_micro_batch_size_override is not None:
+                assign_kwargs["log_prob_micro_batch_size_override"] = int(log_prob_micro_batch_size_override)
+            tu.assign_non_tensor(batch_td, **assign_kwargs)
             output = self.actor_rollout_wg.compute_log_prob(batch_td)
             # gather output
-            entropy = tu.get(output, "entropy")
+            entropy = tu.get(output, "entropy") if calculate_entropy else None
             log_probs = tu.get(output, "log_probs")
             old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
             # step 4. No padding to padding
-            entropy = no_padding_2_padding(entropy, batch_td)
+            if calculate_entropy and entropy is not None:
+                entropy = no_padding_2_padding(entropy, batch_td)
             log_probs = no_padding_2_padding(log_probs, batch_td)
             # step 5: rebuild a tensordict and convert to dataproto
-            old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
+            old_log_prob_tensors = {"old_log_probs": log_probs.float()}
+            if calculate_entropy and entropy is not None:
+                old_log_prob_tensors["entropys"] = entropy.float()
+            old_log_prob = tu.get_tensordict(old_log_prob_tensors)
             old_log_prob = DataProto.from_tensordict(old_log_prob)
         else:
+            if log_prob_micro_batch_size_override is not None:
+                batch.meta_info["log_prob_micro_batch_size_override"] = int(log_prob_micro_batch_size_override)
+            batch.meta_info["calculate_entropy"] = bool(calculate_entropy)
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
             old_log_prob_mfu = 0
         return old_log_prob, old_log_prob_mfu
@@ -1532,6 +1578,11 @@ class RayPPOTrainer:
             "training_mode": str(self.m2_replay_training_mode),
             "beta": float(self.m2_replay_recent_learning_beta),
             "lambda": float(self.m2_replay_recent_learning_decay_lambda),
+            "zvp_weight": float(self.m2_replay_zvp_weight),
+            "zvp_ema_alpha": float(self.m2_replay_zvp_ema_alpha),
+            "zvp_adv_pos_eps": float(self.m2_replay_zvp_adv_pos_eps),
+            "zvp_lambda_neg": float(self.m2_replay_zvp_lambda_neg),
+            "zvp_use_recency": bool(self.m2_replay_zvp_use_recency),
             "onpolicy_groups": int(onpolicy_train_groups),
             "onpolicy_ingress_groups": len(onpolicy_ingress_query_ids),
             "replay_target_groups": int(replay_target_groups),
@@ -1555,12 +1606,52 @@ class RayPPOTrainer:
             json.dump(payload, file, ensure_ascii=False)
 
     def _m2_compute_new_log_probs(self, group_data: DataProto) -> torch.Tensor:
-        new_log_prob_dp, _ = self._compute_old_log_prob(group_data)
+        new_log_prob_dp, _ = self._compute_old_log_prob(
+            group_data,
+            calculate_entropy=False,
+            log_prob_micro_batch_size_override=self.m2_replay_log_prob_micro_batch_size_per_gpu,
+        )
         return new_log_prob_dp.batch["old_log_probs"]
 
-    def _m2_build_actor_batch(self, batch: DataProto, metrics: dict[str, float]) -> DataProto:
+    def _m2_compute_new_log_probs_batch(self, group_data_list: list[DataProto]) -> list[torch.Tensor]:
+        if not group_data_list:
+            return []
+
+        merged_group_data = DataProto.concat(group_data_list)
+        merged_new_log_prob_dp, _ = self._compute_old_log_prob(
+            merged_group_data,
+            calculate_entropy=False,
+            log_prob_micro_batch_size_override=self.m2_replay_log_prob_micro_batch_size_per_gpu,
+        )
+        merged_new_log_probs = merged_new_log_prob_dp.batch["old_log_probs"]
+
+        split_new_log_probs: list[torch.Tensor] = []
+        start = 0
+        for group_data in group_data_list:
+            if group_data.batch is None or "old_log_probs" not in group_data.batch.keys():
+                raise ValueError("group_data.batch must contain old_log_probs for batched replay logprob evaluation.")
+            group_len = int(group_data.batch["old_log_probs"].shape[0])
+            end = start + group_len
+            split_new_log_probs.append(merged_new_log_probs[start:end])
+            start = end
+
+        if start != int(merged_new_log_probs.shape[0]):
+            raise ValueError(
+                "Batched replay logprob split mismatch: "
+                f"consumed={start}, total={int(merged_new_log_probs.shape[0])}."
+            )
+
+        return split_new_log_probs
+
+    def _m2_build_actor_batch(
+        self,
+        batch: DataProto,
+        metrics: dict[str, float],
+        timing_raw: Optional[dict[str, float]] = None,
+    ) -> DataProto:
         if not self.m2_replay_enabled or self.m2_replay_buffer is None:
             return batch
+        m2_timing_raw = timing_raw if timing_raw is not None else {}
 
         rollout_n = int(self.config.actor_rollout_ref.rollout.n)
         onpolicy_query_ids: list[str] = []
@@ -1584,25 +1675,34 @@ class RayPPOTrainer:
             metrics[self._m2_key("buffer/size")] = float(len(self.m2_replay_buffer))
             return batch
 
-        # Groups filtered for replay ingress (buffer append only).
-        group_build_result = build_query_groups_from_onpolicy_batch(
-            batch=batch,
-            expected_group_size=rollout_n,
-            insertion_step=self.global_steps,
-            success_count_min=1 if self.m2_replay_ingress_filter_mode == "rlvr_halfband" else None,
-            success_count_max=(rollout_n // 2) if self.m2_replay_ingress_filter_mode == "rlvr_halfband" else None,
-        )
-        metrics.update(group_build_result.to_metrics(prefix=self.m2_replay_prefix))
+        # Build full on-policy groups once; derive ingress subset via filter.
+        with marked_timer("m2_prepare_onpolicy_groups", m2_timing_raw, color="yellow"):
+            group_build_result = build_query_groups_from_onpolicy_batch(
+                batch=batch,
+                expected_group_size=rollout_n,
+                insertion_step=self.global_steps,
+                zvp_lambda_neg=self.m2_replay_zvp_lambda_neg,
+            )
+            onpolicy_all_groups = group_build_result.groups
+            if self.m2_replay_ingress_filter_mode == "rlvr_halfband":
+                success_count_min = 1
+                success_count_max = rollout_n // 2
+                onpolicy_ingress_groups = [
+                    group
+                    for group in onpolicy_all_groups
+                    if int(group.success_count) >= success_count_min and int(group.success_count) <= success_count_max
+                ]
+                skipped_by_success_band = len(onpolicy_all_groups) - len(onpolicy_ingress_groups)
+            else:
+                onpolicy_ingress_groups = onpolicy_all_groups
+                skipped_by_success_band = 0
 
-        # Full on-policy groups (for actor batch construction / ADV=0 split).
-        full_group_build_result = build_query_groups_from_onpolicy_batch(
-            batch=batch,
-            expected_group_size=rollout_n,
-            insertion_step=self.global_steps,
-        )
-        onpolicy_all_groups = full_group_build_result.groups
+        metrics[self._m2_key("buffer/new_groups")] = float(len(onpolicy_ingress_groups))
+        metrics[self._m2_key("buffer/skipped_incomplete")] = float(group_build_result.skipped_incomplete)
+        metrics[self._m2_key("buffer/skipped_missing_train_keys")] = float(group_build_result.skipped_missing_train_keys)
+        metrics[self._m2_key("buffer/skipped_by_success_band")] = float(skipped_by_success_band)
 
-        onpolicy_ingress_query_ids = [group.query_id for group in group_build_result.groups]
+        onpolicy_ingress_query_ids = [group.query_id for group in onpolicy_ingress_groups]
         ingress_group_count = len(onpolicy_ingress_query_ids)
 
         onpolicy_nonzero_groups = onpolicy_all_groups
@@ -1653,18 +1753,53 @@ class RayPPOTrainer:
         metrics[self._m2_key("schedule/onpolicy_train_groups")] = float(onpolicy_train_group_count)
         metrics[self._m2_key("schedule/onpolicy_ingress_groups")] = float(ingress_group_count)
         metrics[self._m2_key("schedule/replay_target_groups")] = float(replay_target_groups)
-
-        selection = select_replay_groups(
-            buffer=self.m2_replay_buffer,
-            target_groups=replay_target_groups,
-            tau=self.m2_replay_tau,
-            compute_new_log_probs_fn=self._m2_compute_new_log_probs,
-            max_scan=len(self.m2_replay_buffer),
-            current_step=int(self.global_steps),
-            selection_mode=self.m2_replay_selection_mode,
-            recency_beta=self.m2_replay_recent_learning_beta,
-            recency_decay_lambda=self.m2_replay_recent_learning_decay_lambda,
+        effective_log_prob_micro_batch = (
+            int(self.m2_replay_log_prob_micro_batch_size_per_gpu)
+            if self.m2_replay_log_prob_micro_batch_size_per_gpu is not None
+            else int(self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu)
         )
+        metrics[self._m2_key("selection/log_prob_micro_batch_size_per_gpu")] = float(effective_log_prob_micro_batch)
+
+        buffer_size_pre_select = len(self.m2_replay_buffer)
+        buffer_capacity = int(self.m2_replay_buffer.max_query_groups)
+        buffer_inserted = int(getattr(self.m2_replay_buffer, "_insertion_counter", buffer_size_pre_select))
+        one_turnover_ready = (buffer_size_pre_select >= buffer_capacity) and (buffer_inserted >= (2 * buffer_capacity))
+        metrics[self._m2_key("gating/one_turnover_enabled")] = float(bool(self.m2_replay_one_turnover_gate))
+        metrics[self._m2_key("gating/one_turnover_ready")] = float(bool(one_turnover_ready))
+        metrics[self._m2_key("gating/buffer_size_pre_select")] = float(buffer_size_pre_select)
+        metrics[self._m2_key("gating/buffer_capacity")] = float(buffer_capacity)
+        metrics[self._m2_key("gating/buffer_inserted_pre_select")] = float(buffer_inserted)
+
+        with marked_timer("m2_select_replay_total", m2_timing_raw, color="yellow"):
+            if self.m2_replay_one_turnover_gate and not one_turnover_ready:
+                selection = ReplaySelectionResult(
+                    selected_groups=[],
+                    scanned_groups=0,
+                    target_groups=max(int(replay_target_groups), 0),
+                    rejected_missing_fields=0,
+                    rejected_by_tau=0,
+                    rejected_eval_error=0,
+                )
+            else:
+                selection = select_replay_groups(
+                    buffer=self.m2_replay_buffer,
+                    target_groups=replay_target_groups,
+                    tau=self.m2_replay_tau,
+                    compute_new_log_probs_fn=self._m2_compute_new_log_probs,
+                    compute_new_log_probs_batch_fn=self._m2_compute_new_log_probs_batch,
+                    max_scan=len(self.m2_replay_buffer),
+                    current_step=int(self.global_steps),
+                    selection_mode=self.m2_replay_selection_mode,
+                    recency_beta=self.m2_replay_recent_learning_beta,
+                    recency_decay_lambda=self.m2_replay_recent_learning_decay_lambda,
+                    zvp_weight=self.m2_replay_zvp_weight,
+                    adv_pos_eps=self.m2_replay_zvp_adv_pos_eps,
+                    zvp_lambda_neg=self.m2_replay_zvp_lambda_neg,
+                    zvp_use_recency=self.m2_replay_zvp_use_recency,
+                    groups_per_chunk=self.m2_replay_logprob_groups_per_chunk,
+                    build_candidate_priority_all=self.m2_replay_dump_full_scores,
+                    timing_raw=m2_timing_raw,
+                )
         metrics.update(selection.to_metrics(prefix=self.m2_replay_prefix))
 
         replay_groups = selection.selected_groups
@@ -1703,13 +1838,44 @@ class RayPPOTrainer:
                     replay_trimmed_for_floor = len(replay_groups) - max_replay_for_floor
                     replay_groups = replay_groups[:max_replay_for_floor]
 
+        selected_debug_by_query: dict[str, dict[str, object]] = {
+            str(entry.get("query_id")): entry for entry in selection.selected_priority_debug
+        }
         for group in replay_groups:
+            debug_entry = selected_debug_by_query.get(group.query_id, None)
+            if debug_entry is not None and "zvp_runtime_score" in debug_entry:
+                runtime_score = float(debug_entry.get("zvp_runtime_score", 0.0))
+                ema_alpha = float(self.m2_replay_zvp_ema_alpha)
+                group.zvp_score = (1.0 - ema_alpha) * float(group.zvp_score) + ema_alpha * runtime_score
+                group.zvp_mean_surprisal = float(debug_entry.get("zvp_runtime_mean_surprisal", group.zvp_mean_surprisal))
+                group.zvp_neg_frac = float(debug_entry.get("zvp_runtime_neg_frac", group.zvp_neg_frac))
+                group.zvp_pos_frac = float(debug_entry.get("zvp_runtime_pos_frac", group.zvp_pos_frac))
+                group.zvp_last_update_step = int(self.global_steps)
+                group.zvp_update_count = int(group.zvp_update_count) + 1
             group.last_training_step = int(self.global_steps)
         metrics[self._m2_key("pass2/selected_groups")] = float(selected_groups)
         metrics[self._m2_key("pass2/used_groups")] = float(len(replay_groups))
         metrics[self._m2_key("selection/replay_used")] = float(len(replay_groups))
         metrics[self._m2_key("selection/replay_trimmed_for_floor")] = float(replay_trimmed_for_floor)
         metrics[self._m2_key("selection/fixed_total_target_applied")] = float(applied_total_groups)
+        if replay_groups:
+            metrics[self._m2_key("selection/used_zvp_mean")] = float(
+                sum(float(group.zvp_score) for group in replay_groups) / len(replay_groups)
+            )
+            metrics[self._m2_key("selection/used_zvp_surprisal_mean")] = float(
+                sum(float(group.zvp_mean_surprisal) for group in replay_groups) / len(replay_groups)
+            )
+            metrics[self._m2_key("selection/used_zvp_neg_frac_mean")] = float(
+                sum(float(group.zvp_neg_frac) for group in replay_groups) / len(replay_groups)
+            )
+            metrics[self._m2_key("selection/used_zvp_pos_frac_mean")] = float(
+                sum(float(group.zvp_pos_frac) for group in replay_groups) / len(replay_groups)
+            )
+        else:
+            metrics[self._m2_key("selection/used_zvp_mean")] = 0.0
+            metrics[self._m2_key("selection/used_zvp_surprisal_mean")] = 0.0
+            metrics[self._m2_key("selection/used_zvp_neg_frac_mean")] = 0.0
+            metrics[self._m2_key("selection/used_zvp_pos_frac_mean")] = 0.0
 
         if self.m2_replay_training_mode == "fixed_total_with_adv0_drop":
             fallback_needed = max(applied_total_groups - len(onpolicy_nonzero_groups) - len(replay_groups), 0)
@@ -1748,7 +1914,18 @@ class RayPPOTrainer:
 
         def _round_score_entry(entry: dict[str, object]) -> dict[str, object]:
             rounded = dict(entry)
-            for key in ["score", "uncertainty", "recency_value", "success_prob", "m2"]:
+            for key in [
+                "score",
+                "uncertainty",
+                "recency_value",
+                "success_prob",
+                "m2",
+                "zvp_score",
+                "zvp_runtime_score",
+                "zvp_runtime_mean_surprisal",
+                "zvp_runtime_neg_frac",
+                "zvp_runtime_pos_frac",
+            ]:
                 if key in rounded:
                     rounded[key] = round(float(rounded[key]), 6)
             return rounded
@@ -1759,27 +1936,28 @@ class RayPPOTrainer:
         used_score_preview = [
             _round_score_entry(entry) for entry in selection.selected_priority_debug[: len(replay_groups)]
         ][:score_preview_limit]
-        self._m2_dump_full_scores(
-            selection=selection,
-            group_build_result=group_build_result,
-            onpolicy_query_ids=onpolicy_query_ids,
-            onpolicy_ingress_query_ids=onpolicy_ingress_query_ids,
-            replay_query_ids=replay_query_ids,
-            onpolicy_train_groups=onpolicy_train_group_count,
-            replay_target_groups=replay_target_groups,
-            selected_groups=selected_groups,
-            used_groups=len(replay_groups),
-            extra_payload={
-                "fixed_total_groups": int(fixed_total_groups),
-                "fixed_total_floor_groups": int(fixed_total_floor_groups),
-                "fixed_total_target_applied": int(applied_total_groups),
-                "replay_trimmed_for_floor": int(replay_trimmed_for_floor),
-                "onpolicy_nonzero_query_ids": [group.query_id for group in onpolicy_nonzero_groups],
-                "onpolicy_adv0_query_ids": [group.query_id for group in onpolicy_adv0_groups],
-                "fallback_adv0_query_ids": [group.query_id for group in fallback_adv0_groups],
-                "final_train_groups": int(final_train_groups),
-            },
-        )
+        with marked_timer("m2_dump_full_scores", m2_timing_raw, color="yellow"):
+            self._m2_dump_full_scores(
+                selection=selection,
+                group_build_result=group_build_result,
+                onpolicy_query_ids=onpolicy_query_ids,
+                onpolicy_ingress_query_ids=onpolicy_ingress_query_ids,
+                replay_query_ids=replay_query_ids,
+                onpolicy_train_groups=onpolicy_train_group_count,
+                replay_target_groups=replay_target_groups,
+                selected_groups=selected_groups,
+                used_groups=len(replay_groups),
+                extra_payload={
+                    "fixed_total_groups": int(fixed_total_groups),
+                    "fixed_total_floor_groups": int(fixed_total_floor_groups),
+                    "fixed_total_target_applied": int(applied_total_groups),
+                    "replay_trimmed_for_floor": int(replay_trimmed_for_floor),
+                    "onpolicy_nonzero_query_ids": [group.query_id for group in onpolicy_nonzero_groups],
+                    "onpolicy_adv0_query_ids": [group.query_id for group in onpolicy_adv0_groups],
+                    "fallback_adv0_query_ids": [group.query_id for group in fallback_adv0_groups],
+                    "final_train_groups": int(final_train_groups),
+                },
+            )
         print(
             "[m2_replay] "
             f"step={self.global_steps} "
@@ -1810,6 +1988,11 @@ class RayPPOTrainer:
             f"ingress_filter={self.m2_replay_ingress_filter_mode} "
             f"beta={self.m2_replay_recent_learning_beta} "
             f"lambda={self.m2_replay_recent_learning_decay_lambda} "
+            f"zvp_weight={self.m2_replay_zvp_weight} "
+            f"zvp_ema_alpha={self.m2_replay_zvp_ema_alpha} "
+            f"zvp_lambda_neg={self.m2_replay_zvp_lambda_neg} "
+            f"zvp_use_recency={self.m2_replay_zvp_use_recency} "
+            f"log_prob_micro_batch_size_per_gpu={effective_log_prob_micro_batch} "
             f"candidate_scores(first_{score_preview_limit})={candidate_score_preview} "
             f"used_replay_scores(first_{score_preview_limit})={used_score_preview}",
             flush=True,
@@ -1817,15 +2000,17 @@ class RayPPOTrainer:
 
         # Append current on-policy groups after replay selection so same-step groups
         # are not sampled as replay in this iteration.
-        self.m2_replay_buffer.append_groups(group_build_result.groups)
+        with marked_timer("m2_buffer_append", m2_timing_raw, color="yellow"):
+            self.m2_replay_buffer.append_groups(onpolicy_ingress_groups)
         metrics[self._m2_key("buffer/size")] = float(len(self.m2_replay_buffer))
 
-        if self.m2_replay_training_mode == "fixed_total_with_adv0_drop":
-            actor_batch = build_actor_batch_from_groups(onpolicy_groups=onpolicy_actor_groups, replay_groups=replay_groups)
-            if actor_batch is None:
-                actor_batch = build_actor_batch_with_replay(onpolicy_batch=batch, replay_groups=[])
-        else:
-            actor_batch = build_actor_batch_with_replay(onpolicy_batch=batch, replay_groups=replay_groups)
+        with marked_timer("m2_actor_batch_concat", m2_timing_raw, color="yellow"):
+            if self.m2_replay_training_mode == "fixed_total_with_adv0_drop":
+                actor_batch = build_actor_batch_from_groups(onpolicy_groups=onpolicy_actor_groups, replay_groups=replay_groups)
+                if actor_batch is None:
+                    actor_batch = build_actor_batch_with_replay(onpolicy_batch=batch, replay_groups=[])
+            else:
+                actor_batch = build_actor_batch_with_replay(onpolicy_batch=batch, replay_groups=replay_groups)
         actor_batch.meta_info = dict(batch.meta_info)
         if actor_batch.batch is not None and "attention_mask" in actor_batch.batch.keys():
             actor_batch.meta_info["global_token_num"] = torch.sum(actor_batch.batch["attention_mask"], dim=-1).tolist()
@@ -2136,7 +2321,8 @@ class RayPPOTrainer:
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
-                        actor_batch = self._m2_build_actor_batch(batch=batch, metrics=metrics)
+                        with marked_timer("m2_build_actor_batch", timing_raw, color="yellow"):
+                            actor_batch = self._m2_build_actor_batch(batch=batch, metrics=metrics, timing_raw=timing_raw)
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(actor_batch)

@@ -137,21 +137,27 @@ def _to_list(value: Any) -> list:
 
 
 def _normalize_doc_id(doc: str) -> str:
-    """Normalize doc id like '14_7' -> '7' when suffix is numeric."""
+    """Normalize doc id by stripping image extensions, preserving full path.
+
+    Preserves directory structure for cross-source disambiguation
+    (e.g. docvqa/abc_14 vs infovqa/xyz_14) and SlideVQA slide distinction
+    (e.g. slide_1_1024 vs slide_4_1024).
+    """
     s = str(doc)
-    s = os.path.splitext(s)[0]
-    if '_' in s:
-        last = s.split('_')[-1]
-        if last.isdigit():
-            return last
+    for ext in (".jpg", ".jpeg", ".png"):
+        if s.endswith(ext):
+            s = s[: -len(ext)]
+            break
     return s
 
 def _basename_no_ext(path: Any) -> str:
-    p = str(path).rstrip("/")
-    base = os.path.basename(p)
-    if base.endswith(".jpg"):
-        base = base[:-4]
-    return base
+    """Strip image extension, preserving full path for cross-source disambiguation."""
+    s = str(path).rstrip("/")
+    for ext in (".jpg", ".jpeg", ".png"):
+        if s.endswith(ext):
+            s = s[: -len(ext)]
+            break
+    return s
 
 
 def _extract_retrieved(extra_info: dict) -> list[str]:
