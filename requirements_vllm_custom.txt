@@ -135,7 +135,7 @@ nvtx==0.2.14
 oauthlib==3.2.0
 omegaconf==2.3.0
 onnx==1.20.0
-onnx-ir==0.1.13
+onnx-ir==0.2.0
 onnxscript==0.5.7
 openai==2.14.0
 openai-harmony==0.0.8
