@@ -1,10 +1,12 @@
 import numpy as np
+import pytest
 import torch
 
 from verl import DataProto
 from verl.trainer.ppo.m2_replay import (
     QueryGroup,
     QueryGroupReplayBuffer,
+    compute_group_zvp_stats,
     derive_micro_group_multiple,
     select_replay_groups,
 )
@@ -96,3 +98,79 @@ def test_select_replay_groups_prefers_less_recently_trained_group():
 
     assert len(result.selected_groups) == 1
     assert result.selected_groups[0].query_id == "old_q"
+
+
+def test_compute_group_zvp_stats_adv_magnitude_changes_score():
+    probs = torch.tensor([[0.2, 0.9, 0.9]], dtype=torch.float32)
+    log_probs = torch.log(probs)
+    advantages = torch.tensor([[10.0, -1.0, -1.0]], dtype=torch.float32)
+    response_mask = torch.ones_like(advantages)
+
+    sign_only_score, _, neg_frac, pos_frac = compute_group_zvp_stats(
+        log_probs=log_probs,
+        advantages=advantages,
+        response_mask=response_mask,
+        zvp_mode="sign_only",
+    )
+    adv_magnitude_score, _, neg_frac_weighted, pos_frac_weighted = compute_group_zvp_stats(
+        log_probs=log_probs,
+        advantages=advantages,
+        response_mask=response_mask,
+        zvp_mode="adv_magnitude",
+    )
+
+    assert sign_only_score == pytest.approx((0.8 + 0.9 + 0.9) / 3.0, rel=1e-6)
+    assert adv_magnitude_score == pytest.approx((0.8 * 10.0 + 0.9 + 0.9) / 12.0, rel=1e-6)
+    assert adv_magnitude_score < sign_only_score
+    assert neg_frac == pytest.approx(2.0 / 3.0)
+    assert pos_frac == pytest.approx(1.0 / 3.0)
+    assert neg_frac_weighted == pytest.approx(neg_frac)
+    assert pos_frac_weighted == pytest.approx(pos_frac)
+
+
+def test_select_replay_groups_runtime_zvp_uses_requested_mode():
+    old = torch.log(torch.tensor([[0.2, 0.9, 0.9]], dtype=torch.float32))
+    advantages = torch.tensor([[10.0, -1.0, -1.0]], dtype=torch.float32)
+    mask = torch.ones_like(advantages)
+    data = DataProto.from_dict(
+        tensors={
+            "old_log_probs": old,
+            "response_mask": mask,
+            "advantages": advantages,
+            "delta": torch.zeros_like(old),
+        },
+        non_tensors={"uid": np.array(["q1"], dtype=object)},
+    )
+    group = QueryGroup(query_id="q1", data=data, success_prob=0.0625, insertion_step=1)
+    buffer = QueryGroupReplayBuffer(max_query_groups=4, seed=0)
+    buffer.append_group(group)
+
+    def compute_new(data: DataProto) -> torch.Tensor:
+        return data.batch["old_log_probs"] + data.batch["delta"]
+
+    sign_only = select_replay_groups(
+        buffer=buffer,
+        target_groups=1,
+        tau=1e-6,
+        compute_new_log_probs_fn=compute_new,
+        max_scan=1,
+        selection_mode="zvp_recency",
+        zvp_mode="sign_only",
+    )
+    adv_magnitude = select_replay_groups(
+        buffer=buffer,
+        target_groups=1,
+        tau=1e-6,
+        compute_new_log_probs_fn=compute_new,
+        max_scan=1,
+        selection_mode="zvp_recency",
+        zvp_mode="adv_magnitude",
+    )
+
+    assert len(sign_only.selected_groups) == 1
+    assert len(adv_magnitude.selected_groups) == 1
+    sign_only_runtime = sign_only.selected_priority_debug[0]["zvp_runtime_score"]
+    adv_magnitude_runtime = adv_magnitude.selected_priority_debug[0]["zvp_runtime_score"]
+    assert sign_only_runtime == pytest.approx((0.8 + 0.9 + 0.9) / 3.0, rel=1e-6)
+    assert adv_magnitude_runtime == pytest.approx((0.8 * 10.0 + 0.9 + 0.9) / 12.0, rel=1e-6)
+    assert adv_magnitude_runtime < sign_only_runtime

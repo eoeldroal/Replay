@@ -135,20 +135,27 @@ class QueryGroupReplayBuffer:
                 group.zvp_update_count = 0
 
 
+def normalize_zvp_mode(zvp_mode: str) -> str:
+    normalized_mode = str(zvp_mode).strip().lower()
+    if normalized_mode not in {"sign_only", "adv_magnitude"}:
+        return "sign_only"
+    return normalized_mode
+
+
 def compute_group_zvp_stats(
     log_probs: torch.Tensor,
     advantages: torch.Tensor,
     response_mask: torch.Tensor,
     adv_pos_eps: float = 1e-8,
     lambda_neg: float = 1.0,
+    zvp_mode: str = "sign_only",
 ) -> tuple[float, float, float, float]:
     """Compute ZVP statistics from token log-probs and advantages.
 
-    Sign-only symmetric score (project-specific):
-    - Positive-advantage tokens: reward low token probability (1 - p).
-    - Negative-advantage tokens: reward high token probability (p).
-    - Advantage magnitude is intentionally ignored.
-    - Uses bounded token terms in [0, 1] without per-group min-max scaling.
+    Supported modes:
+    - sign_only: symmetric score that ignores advantage magnitude.
+    - adv_magnitude: self-normalized |advantage|-weighted score over the same
+      bounded token terms.
     """
     if log_probs.shape != advantages.shape or log_probs.shape != response_mask.shape:
         raise ValueError(
@@ -179,12 +186,23 @@ def compute_group_zvp_stats(
         neg_term[neg_mask] = probs[neg_mask]
 
     token_score = pos_term + float(lambda_neg) * neg_term
-    score = float(token_score[mask].mean().item())
+    normalized_mode = normalize_zvp_mode(zvp_mode)
+    if normalized_mode == "adv_magnitude":
+        active_mask = pos_mask | neg_mask
+        abs_adv = adv.abs()
+        weights = torch.zeros_like(abs_adv)
+        weights[active_mask] = abs_adv[active_mask]
+        denom = float(weights.sum().item())
+        if denom > 0.0:
+            score = float(((token_score * weights).sum() / denom).item())
+        else:
+            score = 0.0
+    else:
+        score = float(token_score[mask].mean().item())
 
     mean_surprisal = float(surprisal[mask].mean().item())
     pos_frac = float(pos_count / total_count)
     neg_frac = float(neg_count / total_count)
-    # Keep tuple shape stable: third item stores neg_frac in sign-only mode.
     return (score, mean_surprisal, neg_frac, pos_frac)
 
 
@@ -287,6 +305,7 @@ def select_replay_groups(
     adv_pos_eps: float = 1e-8,
     zvp_lambda_neg: float = 1.0,
     zvp_use_recency: bool = True,
+    zvp_mode: str = "sign_only",
     groups_per_chunk: int = 1,
     build_candidate_priority_all: bool = True,
     timing_raw: Optional[dict[str, float]] = None,
@@ -305,6 +324,7 @@ def select_replay_groups(
     normalized_mode = str(selection_mode).strip().lower()
     if normalized_mode not in {"legacy_uncertainty_recency", "recency_only", "zvp_recency"}:
         normalized_mode = "legacy_uncertainty_recency"
+    normalized_zvp_mode = normalize_zvp_mode(zvp_mode)
     t0 = time.perf_counter()
     candidates = sorted(
         candidates,
@@ -395,6 +415,7 @@ def select_replay_groups(
                     response_mask=response_mask,
                     adv_pos_eps=adv_pos_eps,
                     lambda_neg=zvp_lambda_neg,
+                    zvp_mode=normalized_zvp_mode,
                 )
 
             selected.append(group)

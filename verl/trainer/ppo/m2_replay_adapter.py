@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from verl import DataProto
-from verl.trainer.ppo.m2_replay import QueryGroup, compute_group_zvp_stats
+from verl.trainer.ppo.m2_replay import QueryGroup, compute_group_zvp_stats, normalize_zvp_mode
 
 # Minimal actor training keys.
 ACTOR_BATCH_KEYS = [
@@ -100,6 +100,38 @@ def select_actor_training_view(data: DataProto) -> DataProto:
     return view
 
 
+def normalize_ingress_filter_mode(ingress_filter_mode: str) -> str:
+    normalized_mode = str(ingress_filter_mode).strip().lower()
+    if normalized_mode not in {"none", "rlvr_halfband", "rlvr_non_degenerate"}:
+        return "none"
+    return normalized_mode
+
+
+def filter_query_groups_for_ingress(
+    groups: list[QueryGroup],
+    rollout_n: int,
+    ingress_filter_mode: str,
+) -> tuple[list[QueryGroup], int]:
+    normalized_mode = normalize_ingress_filter_mode(ingress_filter_mode)
+    if normalized_mode == "none":
+        return list(groups), 0
+
+    max_success_count = 0
+    if normalized_mode == "rlvr_halfband":
+        max_success_count = int(rollout_n) // 2
+    elif normalized_mode == "rlvr_non_degenerate":
+        max_success_count = int(rollout_n) - 1
+
+    if max_success_count < 1:
+        return [], len(groups)
+
+    filtered_groups = [
+        group for group in groups if 1 <= int(group.success_count) <= max_success_count
+    ]
+    skipped_groups = len(groups) - len(filtered_groups)
+    return filtered_groups, skipped_groups
+
+
 def build_query_groups_from_onpolicy_batch(
     batch: DataProto,
     expected_group_size: Optional[int],
@@ -107,6 +139,7 @@ def build_query_groups_from_onpolicy_batch(
     success_count_min: Optional[int] = None,
     success_count_max: Optional[int] = None,
     zvp_lambda_neg: float = 1.0,
+    zvp_mode: str = "sign_only",
 ) -> GroupBuildResult:
     if "uid" not in batch.non_tensor_batch:
         return GroupBuildResult(
@@ -124,6 +157,7 @@ def build_query_groups_from_onpolicy_batch(
     skipped_missing_train_keys = 0
     skipped_by_success_band = 0
     group_debug_all: list[dict[str, object]] = []
+    normalized_zvp_mode = normalize_zvp_mode(zvp_mode)
 
     for uid, idxs in uid_groups:
         debug_entry: dict[str, object] = {
@@ -180,6 +214,7 @@ def build_query_groups_from_onpolicy_batch(
                 advantages=actor_group.batch["advantages"],
                 response_mask=actor_group.batch["response_mask"],
                 lambda_neg=zvp_lambda_neg,
+                zvp_mode=normalized_zvp_mode,
             )
             groups[-1].zvp_score = float(zvp_score)
             groups[-1].zvp_mean_surprisal = float(mean_surprisal)

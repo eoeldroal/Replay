@@ -54,12 +54,15 @@ from verl.trainer.ppo.m2_replay import (
     QueryGroupReplayBuffer,
     ReplaySelectionResult,
     derive_micro_group_multiple,
+    normalize_zvp_mode,
     select_replay_groups,
 )
 from verl.trainer.ppo.m2_replay_adapter import (
     build_actor_batch_from_groups,
     build_actor_batch_with_replay,
     build_query_groups_from_onpolicy_batch,
+    filter_query_groups_for_ingress,
+    normalize_ingress_filter_mode,
     split_query_groups_by_adv_zero,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
@@ -392,6 +395,7 @@ class RayPPOTrainer:
         self.m2_replay_zvp_adv_pos_eps = 1e-8
         self.m2_replay_zvp_lambda_neg = 1.0
         self.m2_replay_zvp_use_recency = True
+        self.m2_replay_zvp_mode = "sign_only"
         self.m2_replay_logprob_groups_per_chunk = 1
         self.m2_replay_log_prob_micro_batch_size_per_gpu: Optional[int] = None
         self.m2_replay_dump_full_scores = False
@@ -432,7 +436,14 @@ class RayPPOTrainer:
                         flush=True,
                     )
             self.m2_replay_selection_mode = str(selection_cfg.get("mode", "legacy_uncertainty_recency"))
-            self.m2_replay_ingress_filter_mode = str(selection_cfg.get("ingress_filter_mode", "none"))
+            ingress_filter_mode_raw = str(selection_cfg.get("ingress_filter_mode", "none"))
+            self.m2_replay_ingress_filter_mode = normalize_ingress_filter_mode(ingress_filter_mode_raw)
+            if self.m2_replay_ingress_filter_mode != ingress_filter_mode_raw.strip().lower():
+                print(
+                    f"[m2_replay] Warning: unknown selection.ingress_filter_mode={ingress_filter_mode_raw}. "
+                    "Fallback to none.",
+                    flush=True,
+                )
             self.m2_replay_recent_learning_beta = float(selection_cfg.get("recent_learning_beta", 1.0))
             self.m2_replay_recent_learning_decay_lambda = float(
                 selection_cfg.get("recent_learning_decay_lambda", 4.0)
@@ -443,6 +454,14 @@ class RayPPOTrainer:
             self.m2_replay_zvp_adv_pos_eps = max(float(selection_cfg.get("zvp_adv_pos_eps", 1e-8)), 0.0)
             self.m2_replay_zvp_lambda_neg = max(float(selection_cfg.get("zvp_lambda_neg", 1.0)), 0.0)
             self.m2_replay_zvp_use_recency = bool(selection_cfg.get("zvp_use_recency", True))
+            zvp_mode_raw = str(selection_cfg.get("zvp_mode", "sign_only"))
+            self.m2_replay_zvp_mode = normalize_zvp_mode(zvp_mode_raw)
+            if self.m2_replay_zvp_mode != zvp_mode_raw.strip().lower():
+                print(
+                    f"[m2_replay] Warning: unknown selection.zvp_mode={zvp_mode_raw}. "
+                    "Fallback to sign_only.",
+                    flush=True,
+                )
             self.m2_replay_logprob_groups_per_chunk = max(int(selection_cfg.get("logprob_groups_per_chunk", 1)), 1)
             log_prob_micro_batch_size_cfg = selection_cfg.get("log_prob_micro_batch_size_per_gpu", None)
             if log_prob_micro_batch_size_cfg is None:
@@ -1583,6 +1602,7 @@ class RayPPOTrainer:
             "zvp_adv_pos_eps": float(self.m2_replay_zvp_adv_pos_eps),
             "zvp_lambda_neg": float(self.m2_replay_zvp_lambda_neg),
             "zvp_use_recency": bool(self.m2_replay_zvp_use_recency),
+            "zvp_mode": str(self.m2_replay_zvp_mode),
             "onpolicy_groups": int(onpolicy_train_groups),
             "onpolicy_ingress_groups": len(onpolicy_ingress_query_ids),
             "replay_target_groups": int(replay_target_groups),
@@ -1682,20 +1702,14 @@ class RayPPOTrainer:
                 expected_group_size=rollout_n,
                 insertion_step=self.global_steps,
                 zvp_lambda_neg=self.m2_replay_zvp_lambda_neg,
+                zvp_mode=self.m2_replay_zvp_mode,
             )
             onpolicy_all_groups = group_build_result.groups
-            if self.m2_replay_ingress_filter_mode == "rlvr_halfband":
-                success_count_min = 1
-                success_count_max = rollout_n // 2
-                onpolicy_ingress_groups = [
-                    group
-                    for group in onpolicy_all_groups
-                    if int(group.success_count) >= success_count_min and int(group.success_count) <= success_count_max
-                ]
-                skipped_by_success_band = len(onpolicy_all_groups) - len(onpolicy_ingress_groups)
-            else:
-                onpolicy_ingress_groups = onpolicy_all_groups
-                skipped_by_success_band = 0
+            onpolicy_ingress_groups, skipped_by_success_band = filter_query_groups_for_ingress(
+                groups=onpolicy_all_groups,
+                rollout_n=rollout_n,
+                ingress_filter_mode=self.m2_replay_ingress_filter_mode,
+            )
 
         metrics[self._m2_key("buffer/new_groups")] = float(len(onpolicy_ingress_groups))
         metrics[self._m2_key("buffer/skipped_incomplete")] = float(group_build_result.skipped_incomplete)
@@ -1796,6 +1810,7 @@ class RayPPOTrainer:
                     adv_pos_eps=self.m2_replay_zvp_adv_pos_eps,
                     zvp_lambda_neg=self.m2_replay_zvp_lambda_neg,
                     zvp_use_recency=self.m2_replay_zvp_use_recency,
+                    zvp_mode=self.m2_replay_zvp_mode,
                     groups_per_chunk=self.m2_replay_logprob_groups_per_chunk,
                     build_candidate_priority_all=self.m2_replay_dump_full_scores,
                     timing_raw=m2_timing_raw,
@@ -1992,6 +2007,7 @@ class RayPPOTrainer:
             f"zvp_ema_alpha={self.m2_replay_zvp_ema_alpha} "
             f"zvp_lambda_neg={self.m2_replay_zvp_lambda_neg} "
             f"zvp_use_recency={self.m2_replay_zvp_use_recency} "
+            f"zvp_mode={self.m2_replay_zvp_mode} "
             f"log_prob_micro_batch_size_per_gpu={effective_log_prob_micro_batch} "
             f"candidate_scores(first_{score_preview_limit})={candidate_score_preview} "
             f"used_replay_scores(first_{score_preview_limit})={used_score_preview}",

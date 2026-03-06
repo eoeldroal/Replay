@@ -515,3 +515,80 @@ freshness는 좋아지겠지만 sign-only bias는 남는다.
 ## 16) 최종 요약
 
 `Qwen2.5-Math`에서 replay가 되는 이유는 작은 모델이라서가 아니라, replay 가치가 높은 group이 fresh하고 짧고 tau-safe하게 남아 있기 때문이다. `Qwen3 rev7`이 실패하는 이유는 stale hard negative가 ranking 상단을 점유하고, 긴 clipped trajectory가 그 stale group을 더 M2-incompatible하게 만들기 때문이다. FIFO는 정상이다. 다만 halfband ingress가 얇아 같은 1024 buffer가 더 긴 step history를 담고, replay refresh도 전혀 일어나지 않는다. 여기에 sign-only ZVP가 `1/16`형 group을 과도하게 우선시한다. 현재까지 가장 근거가 강한 다음 수정 방향은, ingress를 모든 non-degenerate group(`1..15/16`)으로 넓히고 sign-only ZVP를 advantage-magnitude-aware ZVP로 바꾸는 것이다. 단, 첫 목표는 최종 점수 향상보다 replay activation 복구여야 한다.
+
+---
+
+## 17) 2026-03-06 코드 반영
+
+위 가설 수준으로 남겨 두지 않고, 실제 실행 코드에 아래 두 옵션을 추가했다.
+
+### 17.1 ingress filter mode 확장
+
+기존:
+
+- `selection.ingress_filter_mode = rlvr_halfband`
+- 의미: `1 <= success_count <= floor(n / 2)`
+
+추가:
+
+- `selection.ingress_filter_mode = rlvr_non_degenerate`
+- 의미: `1 <= success_count <= n - 1`
+
+의도:
+
+- `0/n`, `n/n`의 degenerate group만 제외
+- halfband보다 더 넓은 fresh 공급을 허용
+- 기존 script는 기본값이 유지되므로 그대로 실행 가능
+
+구현 위치:
+
+- `verl/trainer/ppo/m2_replay_adapter.py`
+- `verl/trainer/ppo/ray_trainer.py`
+
+### 17.2 ZVP mode 확장
+
+기존:
+
+- `selection.zvp_mode = sign_only`
+- 기본 동작이며 기존 score를 그대로 유지
+
+추가:
+
+- `selection.zvp_mode = adv_magnitude`
+- 같은 bounded token term을 쓰되, `|adv|`로 가중한 self-normalized score 사용
+
+의도:
+
+- sign-only ZVP의 `1/16` 과선호를 완화
+- score scale을 크게 흔들지 않으면서 advantage magnitude를 반영
+- on-policy 초기 cache와 runtime replay 재평가 양쪽에 동일하게 적용
+
+구현 위치:
+
+- `verl/trainer/ppo/m2_replay.py`
+- `verl/trainer/ppo/m2_replay_adapter.py`
+- `verl/trainer/ppo/ray_trainer.py`
+
+### 17.3 rev8 스크립트 추가
+
+새 실행 스크립트:
+
+- `RL_side_3/grpo-qwen3-1.7b-s8-m2-replay-rev8.sh`
+
+`rev7` 대비 변경은 두 개뿐이다.
+
+- `+algorithm.m2_replay.selection.ingress_filter_mode=rlvr_non_degenerate`
+- `+algorithm.m2_replay.selection.zvp_mode=adv_magnitude`
+
+나머지 실험 조건은 `rev7`과 동일하게 유지했다.
+
+### 17.4 이번 변경의 1차 검증 포인트
+
+`rev8`의 1차 성공 기준은 final accuracy가 아니라 replay activation 복구다.
+
+- `m2_replay/selection/replay_used > 0`가 안정적으로 유지되는가
+- top-ranked candidate age가 `rev7`보다 낮아지는가
+- selected success bucket이 `1/16` 독점에서 벗어나는가
+- `accepted_m2_mean`이 `tau=0.001` 아래에서 안정적으로 유지되는가
+
+이 네 가지가 먼저 확인되어야 한다.
