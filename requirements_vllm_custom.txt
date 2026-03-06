@@ -43,7 +43,7 @@ distro==1.7.0
 distro-info==1.1+ubuntu0.2
 dnspython==2.8.0
 docstring_parser==0.17.0
-einops==0.8.1
+einops==0.8.2
 email-validator==2.3.0
 fastapi==0.125.0
 fastapi-cli==0.0.16
