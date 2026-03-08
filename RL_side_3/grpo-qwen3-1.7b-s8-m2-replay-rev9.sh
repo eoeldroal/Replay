@@ -5,8 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 project_name=m2-replay-exp
-experiment_name=grpo-qwen3-1.7b-s8-m2-replay-rev8-tau0025-b1024-ndeg-advmag-bufferfull
-start_mode=buffer_full
+experiment_name=grpo-qwen3-1.7b-s8-m2-replay-rev9-tau0025-b1024-ndeg-plain-quarter
+start_mode=quarter
 
 deepscaler_preview_train_path="$ROOT_DIR/data/deepscaler_preview/train.parquet"
 train_files="['$deepscaler_preview_train_path']"
@@ -78,7 +78,7 @@ python3 -u -m verl.trainer.main_ppo \
     +algorithm.m2_replay.selection.logprob_groups_per_chunk=64 \
     +algorithm.m2_replay.selection.log_prob_micro_batch_size_per_gpu=64 \
     +algorithm.m2_replay.selection.ingress_filter_mode=rlvr_non_degenerate \
-    +algorithm.m2_replay.selection.zvp_mode=adv_magnitude \
+    +algorithm.m2_replay.selection.zvp_mode=plain \
     +algorithm.m2_replay.schedule.floor_to_micro_multiple=true \
     +algorithm.m2_replay.logging.prefix=m2_replay \
     trainer.critic_warmup=0 \

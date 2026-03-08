@@ -83,6 +83,8 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
+VALID_M2_REPLAY_START_MODES = frozenset({"immediate", "quarter", "half", "buffer_full", "two_turnovers"})
+
 
 @dataclass
 class ResourcePoolManager:
@@ -139,6 +141,76 @@ class ResourcePoolManager:
             raise ValueError(
                 f"Total available GPUs {total_available_gpus} is less than total desired GPUs {total_required_gpus}"
             )
+
+
+@dataclass(frozen=True)
+class M2ReplayStartGateState:
+    start_mode: str
+    quarter_threshold: int
+    half_threshold: int
+    quarter_ready: bool
+    half_ready: bool
+    buffer_full_ready: bool
+    two_turnovers_ready: bool
+    selection_ready: bool
+
+
+def normalize_m2_replay_start_mode(start_mode_cfg: Any, legacy_one_turnover_gate: bool = False) -> str:
+    if start_mode_cfg is None or str(start_mode_cfg).strip() == "":
+        return "two_turnovers" if legacy_one_turnover_gate else "immediate"
+
+    start_mode_raw = str(start_mode_cfg).strip().lower()
+    if start_mode_raw not in VALID_M2_REPLAY_START_MODES:
+        return "immediate"
+    return start_mode_raw
+
+
+def compute_m2_replay_start_gate_state(
+    start_mode: str,
+    buffer_size_pre_select: int,
+    buffer_capacity: int,
+    buffer_inserted: int,
+) -> M2ReplayStartGateState:
+    capacity = max(int(buffer_capacity), 0)
+    size = max(int(buffer_size_pre_select), 0)
+    inserted = max(int(buffer_inserted), size)
+
+    if capacity > 0:
+        quarter_threshold = max((capacity + 3) // 4, 1)
+        half_threshold = max((capacity + 1) // 2, 1)
+        quarter_ready = size >= quarter_threshold
+        half_ready = size >= half_threshold
+        buffer_full_ready = size >= capacity
+        two_turnovers_ready = buffer_full_ready and (inserted >= (2 * capacity))
+    else:
+        quarter_threshold = 0
+        half_threshold = 0
+        quarter_ready = True
+        half_ready = True
+        buffer_full_ready = True
+        two_turnovers_ready = True
+
+    if start_mode == "quarter":
+        selection_ready = quarter_ready
+    elif start_mode == "half":
+        selection_ready = half_ready
+    elif start_mode == "buffer_full":
+        selection_ready = buffer_full_ready
+    elif start_mode == "two_turnovers":
+        selection_ready = two_turnovers_ready
+    else:
+        selection_ready = True
+
+    return M2ReplayStartGateState(
+        start_mode=start_mode,
+        quarter_threshold=quarter_threshold,
+        half_threshold=half_threshold,
+        quarter_ready=quarter_ready,
+        half_ready=half_ready,
+        buffer_full_ready=buffer_full_ready,
+        two_turnovers_ready=two_turnovers_ready,
+        selection_ready=selection_ready,
+    )
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -500,18 +572,18 @@ class RayPPOTrainer:
                 )
                 self.m2_replay_fixed_total_floor_groups = 0
             start_mode_cfg = schedule_cfg.get("start_mode", None)
-            if start_mode_cfg is None or str(start_mode_cfg).strip() == "":
-                legacy_one_turnover_gate = bool(schedule_cfg.get("one_turnover_gate", False))
-                start_mode_cfg = "two_turnovers" if legacy_one_turnover_gate else "immediate"
-            start_mode_raw = str(start_mode_cfg).strip().lower()
-            valid_start_modes = {"immediate", "buffer_full", "two_turnovers"}
-            if start_mode_raw not in valid_start_modes:
+            legacy_one_turnover_gate = bool(schedule_cfg.get("one_turnover_gate", False))
+            raw_start_mode = "" if start_mode_cfg is None else str(start_mode_cfg).strip().lower()
+            start_mode_raw = normalize_m2_replay_start_mode(
+                start_mode_cfg=start_mode_cfg,
+                legacy_one_turnover_gate=legacy_one_turnover_gate,
+            )
+            if raw_start_mode and raw_start_mode not in VALID_M2_REPLAY_START_MODES:
                 print(
-                    f"[m2_replay] Warning: unknown schedule.start_mode={start_mode_raw}. "
+                    f"[m2_replay] Warning: unknown schedule.start_mode={raw_start_mode}. "
                     "Fallback to immediate.",
                     flush=True,
                 )
-                start_mode_raw = "immediate"
             self.m2_replay_start_mode = start_mode_raw
             self.m2_replay_one_turnover_gate = self.m2_replay_start_mode == "two_turnovers"
             self.m2_replay_prefix = str(logging_cfg.get("prefix", "m2_replay"))
@@ -1824,19 +1896,26 @@ class RayPPOTrainer:
         buffer_size_pre_select = len(self.m2_replay_buffer)
         buffer_capacity = int(self.m2_replay_buffer.max_query_groups)
         buffer_inserted = int(getattr(self.m2_replay_buffer, "_insertion_counter", buffer_size_pre_select))
-        buffer_full_ready = buffer_size_pre_select >= buffer_capacity
-        two_turnovers_ready = buffer_full_ready and (buffer_inserted >= (2 * buffer_capacity))
-        if self.m2_replay_start_mode == "buffer_full":
-            selection_ready = buffer_full_ready
-        elif self.m2_replay_start_mode == "two_turnovers":
-            selection_ready = two_turnovers_ready
-        else:
-            selection_ready = True
+        start_gate_state = compute_m2_replay_start_gate_state(
+            start_mode=self.m2_replay_start_mode,
+            buffer_size_pre_select=buffer_size_pre_select,
+            buffer_capacity=buffer_capacity,
+            buffer_inserted=buffer_inserted,
+        )
+        buffer_full_ready = start_gate_state.buffer_full_ready
+        two_turnovers_ready = start_gate_state.two_turnovers_ready
+        selection_ready = start_gate_state.selection_ready
         metrics[self._m2_key("gating/start_mode_immediate")] = float(self.m2_replay_start_mode == "immediate")
+        metrics[self._m2_key("gating/start_mode_quarter")] = float(self.m2_replay_start_mode == "quarter")
+        metrics[self._m2_key("gating/start_mode_half")] = float(self.m2_replay_start_mode == "half")
         metrics[self._m2_key("gating/start_mode_buffer_full")] = float(self.m2_replay_start_mode == "buffer_full")
         metrics[self._m2_key("gating/start_mode_two_turnovers")] = float(
             self.m2_replay_start_mode == "two_turnovers"
         )
+        metrics[self._m2_key("gating/quarter_threshold_groups")] = float(start_gate_state.quarter_threshold)
+        metrics[self._m2_key("gating/half_threshold_groups")] = float(start_gate_state.half_threshold)
+        metrics[self._m2_key("gating/quarter_ready")] = float(bool(start_gate_state.quarter_ready))
+        metrics[self._m2_key("gating/half_ready")] = float(bool(start_gate_state.half_ready))
         metrics[self._m2_key("gating/buffer_full_ready")] = float(bool(buffer_full_ready))
         metrics[self._m2_key("gating/two_turnovers_ready")] = float(bool(two_turnovers_ready))
         metrics[self._m2_key("gating/selection_ready")] = float(bool(selection_ready))
@@ -2055,6 +2134,7 @@ class RayPPOTrainer:
         print(
             "[m2_replay] "
             f"step={self.global_steps} "
+            f"start_mode={self.m2_replay_start_mode} "
             f"onpolicy_groups={onpolicy_train_group_count} "
             f"onpolicy_ingress_groups={len(onpolicy_ingress_query_ids)} "
             f"training_mode={self.m2_replay_training_mode} "
