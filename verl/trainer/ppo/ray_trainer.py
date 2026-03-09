@@ -1826,38 +1826,50 @@ class RayPPOTrainer:
         if not group_data_list:
             return []
 
-        reordered_group_data, eval_order = reorder_group_data_for_logprob_eval(group_data_list)
-        merged_group_data = DataProto.concat(reordered_group_data)
-        group_lengths = []
-        for group_data in reordered_group_data:
-            if group_data.batch is None or "old_log_probs" not in group_data.batch.keys():
-                raise ValueError("group_data.batch must contain old_log_probs for replay GPU M2 evaluation.")
-            group_lengths.append(int(group_data.batch["old_log_probs"].shape[0]))
+        try:
+            reordered_group_data, eval_order = reorder_group_data_for_logprob_eval(group_data_list)
+            merged_group_data = DataProto.concat(reordered_group_data)
+            group_lengths = []
+            for group_data in reordered_group_data:
+                if group_data.batch is None or "old_log_probs" not in group_data.batch.keys():
+                    raise ValueError("group_data.batch must contain old_log_probs for replay GPU M2 evaluation.")
+                group_lengths.append(int(group_data.batch["old_log_probs"].shape[0]))
 
-        merged_group_data.meta_info["m2_group_lengths"] = group_lengths
-        merged_group_data.meta_info["compute_runtime_zvp"] = False
-        if self.m2_replay_log_prob_micro_batch_size_per_gpu is not None:
-            merged_group_data.meta_info["log_prob_micro_batch_size_override"] = int(
-                self.m2_replay_log_prob_micro_batch_size_per_gpu
-            )
-        if self.m2_replay_log_prob_use_dynamic_bsz is not None:
-            merged_group_data.meta_info["log_prob_use_dynamic_bsz_override"] = bool(
-                self.m2_replay_log_prob_use_dynamic_bsz
-            )
-        if self.m2_replay_log_prob_max_token_len_per_gpu is not None:
-            merged_group_data.meta_info["log_prob_max_token_len_override"] = int(
-                self.m2_replay_log_prob_max_token_len_per_gpu
-            )
+            merged_group_data.meta_info["m2_group_lengths"] = group_lengths
+            merged_group_data.meta_info["compute_runtime_zvp"] = False
+            if self.m2_replay_log_prob_micro_batch_size_per_gpu is not None:
+                merged_group_data.meta_info["log_prob_micro_batch_size_override"] = int(
+                    self.m2_replay_log_prob_micro_batch_size_per_gpu
+                )
+            if self.m2_replay_log_prob_use_dynamic_bsz is not None:
+                merged_group_data.meta_info["log_prob_use_dynamic_bsz_override"] = bool(
+                    self.m2_replay_log_prob_use_dynamic_bsz
+                )
+            if self.m2_replay_log_prob_max_token_len_per_gpu is not None:
+                merged_group_data.meta_info["log_prob_max_token_len_override"] = int(
+                    self.m2_replay_log_prob_max_token_len_per_gpu
+                )
 
-        output = self.actor_rollout_wg.compute_log_prob_m2(merged_group_data)
-        m2_tensor = output.batch["m2"]
-        if int(m2_tensor.shape[0]) != len(reordered_group_data):
-            raise ValueError(
-                "compute_log_prob_m2 must return one M2 scalar per group, "
-                f"got {int(m2_tensor.shape[0])} for {len(reordered_group_data)} groups."
-            )
-        m2_list = [float(value) for value in m2_tensor.detach().cpu().tolist()]
-        return restore_group_output_order(m2_list, eval_order)
+            output = self.actor_rollout_wg.compute_log_prob_m2(merged_group_data)
+            m2_tensor = output.batch["m2"]
+            if int(m2_tensor.shape[0]) != len(reordered_group_data):
+                raise ValueError(
+                    "compute_log_prob_m2 must return one M2 scalar per group, "
+                    f"got {int(m2_tensor.shape[0])} for {len(reordered_group_data)} groups."
+                )
+            m2_list = [float(value) for value in m2_tensor.detach().cpu().tolist()]
+            return restore_group_output_order(m2_list, eval_order)
+        except Exception as exc:
+            if not getattr(self, "_m2_fastpath_warning_logged", False):
+                import traceback
+                print(
+                    f"[m2_replay] WARNING: _m2_compute_group_m2_batch failed: "
+                    f"{type(exc).__name__}: {exc}\n"
+                    f"{traceback.format_exc()}",
+                    flush=True,
+                )
+                self._m2_fastpath_warning_logged = True
+            raise  # re-raise so caller's except catches it and falls back
 
     def _m2_build_actor_batch(
         self,

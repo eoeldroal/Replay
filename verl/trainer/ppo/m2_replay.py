@@ -521,6 +521,7 @@ def select_replay_groups(
     tau: float,
     compute_new_log_probs_fn: Callable[[DataProto], torch.Tensor],
     compute_new_log_probs_batch_fn: Optional[Callable[[list[DataProto]], list[torch.Tensor]]] = None,
+    compute_group_m2_batch_fn: Optional[Callable[[list[DataProto]], list[float]]] = None,
     max_scan: Optional[int] = None,
     current_step: int = 0,
     selection_mode: str = "legacy_uncertainty_recency",
@@ -531,6 +532,7 @@ def select_replay_groups(
     zvp_lambda_neg: float = 1.0,
     zvp_use_recency: bool = True,
     zvp_mode: str = "sign_only",
+    compute_runtime_zvp: bool = True,
     groups_per_chunk: int = 1,
     build_candidate_priority_all: bool = True,
     timing_raw: Optional[dict[str, float]] = None,
@@ -615,14 +617,14 @@ def select_replay_groups(
     rejected_by_tau = 0
     rejected_eval_error = 0
     scanned_groups = 0
+    _fastpath_logged: list[bool] = [False]  # mutable container to track one-time warning
 
     def _append_selected_group(
         group: QueryGroup,
         *,
         m2: float,
-        runtime_stats: tuple[float, float, float, float],
+        runtime_stats: Optional[tuple[float, float, float, float]],
     ) -> None:
-        runtime_zvp_score, runtime_zvp_mean_surprisal, runtime_zvp_neg_frac, runtime_zvp_pos_frac = runtime_stats
         selected.append(group)
         accepted_m2.append(m2)
         priority_score, uncertainty, recency_value, age, last_training_step = _priority_terms(
@@ -634,25 +636,30 @@ def select_replay_groups(
             zvp_weight=zvp_weight,
             zvp_use_recency=zvp_use_recency,
         )
-        selected_priority_debug.append(
-            {
-                "query_id": group.query_id,
-                "score": priority_score,
-                "uncertainty": uncertainty,
-                "recency_value": recency_value,
-                "age": age,
-                "last_training_step": last_training_step,
-                "success_prob": float(group.success_prob),
-                "success_count": int(group.success_count),
-                "group_size": int(group.group_size),
-                "m2": float(m2),
-                "zvp_score": float(group.zvp_score),
-                "zvp_runtime_score": float(runtime_zvp_score),
-                "zvp_runtime_mean_surprisal": float(runtime_zvp_mean_surprisal),
-                "zvp_runtime_neg_frac": float(runtime_zvp_neg_frac),
-                "zvp_runtime_pos_frac": float(runtime_zvp_pos_frac),
-            }
-        )
+        debug_entry = {
+            "query_id": group.query_id,
+            "score": priority_score,
+            "uncertainty": uncertainty,
+            "recency_value": recency_value,
+            "age": age,
+            "last_training_step": last_training_step,
+            "success_prob": float(group.success_prob),
+            "success_count": int(group.success_count),
+            "group_size": int(group.group_size),
+            "m2": float(m2),
+            "zvp_score": float(group.zvp_score),
+        }
+        if runtime_stats is not None:
+            runtime_zvp_score, runtime_zvp_mean_surprisal, runtime_zvp_neg_frac, runtime_zvp_pos_frac = runtime_stats
+            debug_entry.update(
+                {
+                    "zvp_runtime_score": float(runtime_zvp_score),
+                    "zvp_runtime_mean_surprisal": float(runtime_zvp_mean_surprisal),
+                    "zvp_runtime_neg_frac": float(runtime_zvp_neg_frac),
+                    "zvp_runtime_pos_frac": float(runtime_zvp_pos_frac),
+                }
+            )
+        selected_priority_debug.append(debug_entry)
 
     def _accept_if_passing_tau(group: QueryGroup, new_log_probs: torch.Tensor) -> None:
         nonlocal rejected_by_tau
@@ -662,8 +669,8 @@ def select_replay_groups(
         m2 = compute_group_m2(old_log_probs=old_log_probs, new_log_probs=new_log_probs, response_mask=response_mask)
 
         if m2 <= tau:
-            runtime_stats = (0.0, 0.0, 0.0, 0.0)
-            if "advantages" in group.data.batch.keys():
+            runtime_stats = None
+            if compute_runtime_zvp and "advantages" in group.data.batch.keys():
                 runtime_stats = compute_group_runtime_zvp_stats_batched(
                     [group],
                     [new_log_probs],
@@ -682,6 +689,7 @@ def select_replay_groups(
         compute_new_log_probs_batch_fn is not None
         and int(groups_per_chunk) > 1
     )
+    use_gpu_m2_fastpath = compute_group_m2_batch_fn is not None and not compute_runtime_zvp
 
     loop_start = time.perf_counter()
     if not use_chunked_logprob:
@@ -724,6 +732,47 @@ def select_replay_groups(
 
             if not valid_groups:
                 continue
+
+            if use_gpu_m2_fastpath:
+                try:
+                    t0 = time.perf_counter()
+                    m2_cpu = [float(m2) for m2 in compute_group_m2_batch_fn([group.data for group in valid_groups])]
+                    if timing_raw is not None:
+                        timing_raw["m2_select_logprob_eval"] = timing_raw.get("m2_select_logprob_eval", 0.0) + (
+                            time.perf_counter() - t0
+                        )
+                    if len(m2_cpu) != len(valid_groups):
+                        raise ValueError(
+                            "compute_group_m2_batch_fn must return one scalar per group, "
+                            f"got {len(m2_cpu)} for {len(valid_groups)} groups."
+                        )
+                except Exception as _fastpath_exc:
+                    if not _fastpath_logged[0]:
+                        import traceback as _tb
+                        print(
+                            f"[m2_replay] WARNING: GPU M2 fastpath failed, falling back to CPU path. "
+                            f"Exception: {type(_fastpath_exc).__name__}: {_fastpath_exc}\n"
+                            f"{_tb.format_exc()}",
+                            flush=True,
+                        )
+                        _fastpath_logged[0] = True
+                    m2_cpu = []
+                else:
+                    remaining_slots = max(int(target_groups) - len(selected), 0)
+                    accepted_indices: list[int] = []
+                    for idx, m2 in enumerate(m2_cpu):
+                        if len(accepted_indices) >= remaining_slots:
+                            break
+                        if float(m2) <= float(tau):
+                            accepted_indices.append(idx)
+                        else:
+                            rejected_by_tau += 1
+
+                    for idx in accepted_indices:
+                        if len(selected) >= target_groups:
+                            break
+                        _append_selected_group(valid_groups[idx], m2=float(m2_cpu[idx]), runtime_stats=None)
+                    continue
 
             try:
                 t0 = time.perf_counter()
@@ -790,7 +839,7 @@ def select_replay_groups(
                     rejected_by_tau += 1
 
             runtime_stats_map: dict[int, tuple[float, float, float, float]] = {}
-            if accepted_indices:
+            if compute_runtime_zvp and accepted_indices:
                 accepted_groups = [valid_groups[idx] for idx in accepted_indices]
                 accepted_new_log_probs = [new_log_probs_list[idx] for idx in accepted_indices]
                 runtime_stats = compute_group_runtime_zvp_stats_batched(
@@ -808,12 +857,13 @@ def select_replay_groups(
             for idx, (group, _) in enumerate(zip(valid_groups, new_log_probs_list, strict=True)):
                 if len(selected) >= target_groups:
                     break
-                if idx not in runtime_stats_map:
+                runtime_stats = runtime_stats_map.get(idx, None)
+                if compute_runtime_zvp and runtime_stats is None:
                     continue
                 _append_selected_group(
                     group,
                     m2=float(m2_cpu[idx]),
-                    runtime_stats=runtime_stats_map[idx],
+                    runtime_stats=runtime_stats,
                 )
     if timing_raw is not None:
         timing_raw["m2_select_scan_loop"] = timing_raw.get("m2_select_scan_loop", 0.0) + (
