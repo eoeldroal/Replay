@@ -9,7 +9,13 @@ import numpy as np
 import torch
 
 from verl import DataProto
-from verl.trainer.ppo.m2_replay import QueryGroup, normalize_zvp_mode, update_query_groups_zvp_stats
+from verl.trainer.ppo.m2_replay import (
+    QueryGroup,
+    normalize_zvp_mode,
+    update_query_groups_zvp_stats,
+    compute_zvp_stats_from_full_batch,
+)
+from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 
 # Minimal actor training keys.
 ACTOR_BATCH_KEYS = [
@@ -47,6 +53,150 @@ class GroupBuildResult:
             f"{prefix}/buffer/skipped_missing_train_keys": float(self.skipped_missing_train_keys),
             f"{prefix}/buffer/skipped_by_success_band": float(self.skipped_by_success_band),
         }
+
+
+def _flatten_attention_lengths(data: DataProto) -> torch.Tensor:
+    if data.batch is None or "attention_mask" not in data.batch.keys():
+        return torch.empty(0, dtype=torch.long)
+    attention_mask = data.batch["attention_mask"]
+    return attention_mask.reshape(attention_mask.shape[0], -1).sum(dim=-1).long()
+
+
+def _compute_group_total_workload(data: DataProto) -> int:
+    seqlen = _flatten_attention_lengths(data)
+    if seqlen.numel() == 0:
+        return 0
+    return int(calculate_workload(seqlen).sum().item())
+
+
+def build_balanced_group_eval_order(group_data_list: list[DataProto]) -> list[int]:
+    if len(group_data_list) <= 2:
+        return list(range(len(group_data_list)))
+
+    workloads = [_compute_group_total_workload(group_data) for group_data in group_data_list]
+    if not any(workloads):
+        return list(range(len(group_data_list)))
+
+    order = sorted(range(len(group_data_list)), key=lambda idx: (workloads[idx], idx))
+    return order[::2] + order[1::2][::-1]
+
+
+def reorder_group_data_for_logprob_eval(group_data_list: list[DataProto]) -> tuple[list[DataProto], list[int]]:
+    eval_order = build_balanced_group_eval_order(group_data_list)
+    reordered = [group_data_list[idx] for idx in eval_order]
+    return reordered, eval_order
+
+
+def restore_group_output_order(outputs: list[torch.Tensor], eval_order: list[int]) -> list[torch.Tensor]:
+    if len(outputs) != len(eval_order):
+        raise ValueError(
+            "restore_group_output_order requires one output per reordered group, "
+            f"got {len(outputs)=} and {len(eval_order)=}."
+        )
+
+    restored: list[Optional[torch.Tensor]] = [None] * len(outputs)
+    for reordered_idx, original_idx in enumerate(eval_order):
+        restored[original_idx] = outputs[reordered_idx]
+
+    if any(tensor is None for tensor in restored):
+        raise ValueError("restore_group_output_order failed to reconstruct the full original group order.")
+
+    return [tensor for tensor in restored if tensor is not None]
+
+
+def rebalance_batch_by_attention(
+    batch: DataProto,
+    *,
+    k_partitions: int,
+    logging_prefix: str,
+) -> dict[str, float]:
+    if batch.batch is None or "attention_mask" not in batch.batch.keys():
+        return {f"{logging_prefix}/applied": 0.0}
+
+    batch_size = int(batch.batch["attention_mask"].shape[0])
+    k_partitions = int(k_partitions)
+    if k_partitions <= 1 or batch_size < k_partitions or batch_size % k_partitions != 0:
+        return {
+            f"{logging_prefix}/applied": 0.0,
+            f"{logging_prefix}/batch_size": float(batch_size),
+            f"{logging_prefix}/k_partitions": float(k_partitions),
+        }
+
+    global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1)
+    workload_lst = calculate_workload(global_seqlen_lst).tolist()
+    global_partition_lst = get_seqlen_balanced_partitions(workload_lst, k_partitions=k_partitions, equal_size=True)
+
+    for idx, partition in enumerate(global_partition_lst):
+        partition.sort(key=lambda sample_idx: (workload_lst[sample_idx], sample_idx))
+        ordered_partition = partition[::2] + partition[1::2][::-1]
+        global_partition_lst[idx] = ordered_partition
+
+    global_idx = torch.tensor([sample_idx for partition in global_partition_lst for sample_idx in partition])
+    batch.reorder(global_idx)
+    metrics = log_seqlen_unbalance(
+        seqlen_list=global_seqlen_lst.tolist(),
+        partitions=global_partition_lst,
+        prefix=logging_prefix,
+    )
+    metrics[f"{logging_prefix}/applied"] = 1.0
+    metrics[f"{logging_prefix}/batch_size"] = float(batch_size)
+    metrics[f"{logging_prefix}/k_partitions"] = float(k_partitions)
+    return metrics
+
+
+def compute_actor_batch_metrics(batch: DataProto, prefix: str = "actor_batch") -> dict[str, float]:
+    if batch.batch is None or "responses" not in batch.batch.keys() or "attention_mask" not in batch.batch.keys():
+        return {}
+
+    max_response_length = int(batch.batch["responses"].shape[-1])
+    response_mask = batch.batch.get("response_mask", batch.batch["attention_mask"][:, -max_response_length:])
+    response_length = response_mask.reshape(response_mask.shape[0], -1).sum(dim=-1).float()
+    prompt_mask = batch.batch["attention_mask"][:, :-max_response_length]
+    prompt_length = prompt_mask.reshape(prompt_mask.shape[0], -1).sum(dim=-1).float()
+    total_token_count = float(batch.batch["attention_mask"].sum().item())
+
+    metrics = {
+        f"{prefix}/groups": float(len(batch)),
+        f"{prefix}/token_count": total_token_count,
+        f"{prefix}/prompt_length_mean": float(prompt_length.mean().item()),
+        f"{prefix}/response_length_mean": float(response_length.mean().item()),
+        f"{prefix}/response_length_max": float(response_length.max().item()),
+        f"{prefix}/response_length_min": float(response_length.min().item()),
+        f"{prefix}/response_clip_ratio": float(torch.eq(response_length, max_response_length).float().mean().item()),
+    }
+
+    if M2_REPLAY_SOURCE_KEY not in batch.batch.keys():
+        return metrics
+
+    replay_mask = batch.batch[M2_REPLAY_SOURCE_KEY].bool()
+    onpolicy_mask = ~replay_mask
+    metrics[f"{prefix}/replay_groups"] = float(replay_mask.sum().item())
+    metrics[f"{prefix}/onpolicy_groups"] = float(onpolicy_mask.sum().item())
+    metrics[f"{prefix}/replay_seq_frac"] = float(replay_mask.float().mean().item())
+
+    token_lengths = batch.batch["attention_mask"].reshape(batch.batch["attention_mask"].shape[0], -1).sum(dim=-1).float()
+    replay_token_count = float(token_lengths[replay_mask].sum().item()) if torch.any(replay_mask) else 0.0
+    onpolicy_token_count = float(token_lengths[onpolicy_mask].sum().item()) if torch.any(onpolicy_mask) else 0.0
+    metrics[f"{prefix}/replay_token_count"] = replay_token_count
+    metrics[f"{prefix}/onpolicy_token_count"] = onpolicy_token_count
+    if total_token_count > 0:
+        metrics[f"{prefix}/replay_token_frac"] = replay_token_count / total_token_count
+        metrics[f"{prefix}/onpolicy_token_frac"] = onpolicy_token_count / total_token_count
+    else:
+        metrics[f"{prefix}/replay_token_frac"] = 0.0
+        metrics[f"{prefix}/onpolicy_token_frac"] = 0.0
+
+    if torch.any(replay_mask):
+        metrics[f"{prefix}/replay_response_length_mean"] = float(response_length[replay_mask].mean().item())
+    else:
+        metrics[f"{prefix}/replay_response_length_mean"] = 0.0
+
+    if torch.any(onpolicy_mask):
+        metrics[f"{prefix}/onpolicy_response_length_mean"] = float(response_length[onpolicy_mask].mean().item())
+    else:
+        metrics[f"{prefix}/onpolicy_response_length_mean"] = 0.0
+
+    return metrics
 
 
 def _group_indices_by_uid(uid_array: np.ndarray) -> list[tuple[str, list[int]]]:
@@ -141,6 +291,33 @@ def _attach_replay_source_flag(data: Optional[DataProto], is_replay: bool) -> Op
     )
     non_tensors = {key: value.copy() for key, value in data.non_tensor_batch.items()}
     return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=dict(data.meta_info))
+
+
+def _attach_replay_source_flag_once(data: Optional[DataProto], replay_prefix_size: int) -> Optional[DataProto]:
+    if data is None:
+        return None
+    if data.batch is None:
+        return data
+
+    replay_prefix_size = max(0, min(int(replay_prefix_size), len(data)))
+    source_flag = torch.zeros((len(data),), dtype=torch.bool, device=data.batch.device)
+    if replay_prefix_size > 0:
+        source_flag[:replay_prefix_size] = True
+    data.batch[M2_REPLAY_SOURCE_KEY] = source_flag
+    return data
+
+
+def _concat_dataprotos(chunks: list[DataProto]) -> Optional[DataProto]:
+    if not chunks:
+        return None
+
+    prepared_chunks: list[DataProto] = []
+    for chunk in chunks:
+        if chunk.meta_info:
+            prepared_chunks.append(type(chunk)(batch=chunk.batch, non_tensor_batch=chunk.non_tensor_batch, meta_info={}))
+        else:
+            prepared_chunks.append(chunk)
+    return DataProto.concat(prepared_chunks)
 
 
 def normalize_ingress_filter_mode(ingress_filter_mode: str) -> str:
@@ -249,37 +426,55 @@ def build_query_groups_from_onpolicy_batch(
         accepted_candidates.append((str(uid), idxs, success_prob, success_count, group_size, debug_entry))
 
     required_keys = {"old_log_probs", "advantages", "response_mask"}
-    for uid, idxs, success_prob, success_count, group_size, debug_entry in accepted_candidates:
-        raw_group = batch[idxs]
-        actor_group = select_actor_training_view(raw_group)
-        if actor_group.batch is None or not required_keys.issubset(set(actor_group.batch.keys())):
-            skipped_missing_train_keys += 1
-            debug_entry["status"] = "skipped_missing_train_keys"
-            group_debug_all.append(debug_entry)
-            continue
-
-        groups.append(
-            QueryGroup(
-                query_id=uid,
-                data=actor_group,
-                success_prob=success_prob,
-                insertion_step=int(insertion_step),
-                success_count=int(success_count),
-                group_size=int(group_size),
-                last_training_step=int(insertion_step),
-            )
-        )
-        debug_entry["status"] = "accepted"
-        group_debug_all.append(debug_entry)
+    if accepted_candidates:
+        actor_view_batch = select_actor_training_view(batch)
+        actor_view_keys = set(actor_view_batch.batch.keys()) if actor_view_batch.batch is not None else set()
+        if actor_view_batch.batch is None or not required_keys.issubset(actor_view_keys):
+            skipped_missing_train_keys += len(accepted_candidates)
+            for _, _, _, _, _, debug_entry in accepted_candidates:
+                debug_entry["status"] = "skipped_missing_train_keys"
+                group_debug_all.append(debug_entry)
+        else:
+            for uid, idxs, success_prob, success_count, group_size, debug_entry in accepted_candidates:
+                actor_group = actor_view_batch[idxs]
+                groups.append(
+                    QueryGroup(
+                        query_id=uid,
+                        data=actor_group,
+                        success_prob=success_prob,
+                        insertion_step=int(insertion_step),
+                        success_count=int(success_count),
+                        group_size=int(group_size),
+                        last_training_step=int(insertion_step),
+                    )
+                )
+                debug_entry["status"] = "accepted"
+                group_debug_all.append(debug_entry)
 
     if compute_zvp_stats and groups:
-        update_query_groups_zvp_stats(
-            groups,
-            lambda_neg=zvp_lambda_neg,
-            zvp_mode=normalized_zvp_mode,
-            update_step=int(insertion_step),
-            chunk_size=int(zvp_chunk_size),
-        )
+        if expected_group_size is not None and expected_group_size > 0:
+            # Fast path: one vectorized pass over a contiguous group-ordered batch (no re-stacking).
+            # INVARIANT: groups are built from accepted_candidates in uid-first-seen order.
+            # Each group.data is actor_view_batch[idxs], so concatenating them produces a batch
+            # where group i covers rows [i*expected_group_size : (i+1)*expected_group_size].
+            ordered_batch = _concat_dataprotos([g.data for g in groups])
+            compute_zvp_stats_from_full_batch(
+                groups=groups,
+                batch=ordered_batch,
+                group_size=expected_group_size,
+                zvp_mode=normalized_zvp_mode,
+                lambda_neg=zvp_lambda_neg,
+                update_step=int(insertion_step),
+            )
+        else:
+            # Fallback: per-group stacking (non-uniform group sizes).
+            update_query_groups_zvp_stats(
+                groups,
+                lambda_neg=zvp_lambda_neg,
+                zvp_mode=normalized_zvp_mode,
+                update_step=int(insertion_step),
+                chunk_size=int(zvp_chunk_size),
+            )
 
     return GroupBuildResult(
         groups=groups,
@@ -293,25 +488,18 @@ def build_query_groups_from_onpolicy_batch(
 def concat_query_groups(groups: list[QueryGroup]) -> Optional[DataProto]:
     if not groups:
         return None
-    sanitized = []
-    for group in groups:
-        dp = group.data
-        dp.meta_info = {}
-        sanitized.append(dp)
-    return DataProto.concat(sanitized)
+    return _concat_dataprotos([group.data for group in groups])
 
 
 def build_actor_batch_with_replay(onpolicy_batch: DataProto, replay_groups: list[QueryGroup]) -> DataProto:
-    onpolicy_actor_batch = _attach_replay_source_flag(select_actor_training_view(onpolicy_batch), is_replay=False)
+    onpolicy_actor_batch = select_actor_training_view(onpolicy_batch)
     if not replay_groups:
-        return onpolicy_actor_batch
+        return _attach_replay_source_flag_once(onpolicy_actor_batch, replay_prefix_size=0)
 
-    replay_batch = _attach_replay_source_flag(concat_query_groups(replay_groups), is_replay=True)
-    if replay_batch is None:
-        return onpolicy_actor_batch
-
-    merged = DataProto.concat([replay_batch, onpolicy_actor_batch])
-    return merged
+    replay_chunks = [group.data for group in replay_groups]
+    merged = _concat_dataprotos(replay_chunks + [onpolicy_actor_batch])
+    replay_prefix_size = sum(len(group.data) for group in replay_groups)
+    return _attach_replay_source_flag_once(merged, replay_prefix_size=replay_prefix_size)
 
 
 def split_query_groups_by_adv_zero(
@@ -346,18 +534,10 @@ def split_query_groups_by_adv_zero(
 
 
 def build_actor_batch_from_groups(onpolicy_groups: list[QueryGroup], replay_groups: list[QueryGroup]) -> Optional[DataProto]:
-    chunks: list[DataProto] = []
-
-    replay_batch = _attach_replay_source_flag(concat_query_groups(replay_groups), is_replay=True)
-    if replay_batch is not None:
-        chunks.append(replay_batch)
-
-    onpolicy_batch = _attach_replay_source_flag(concat_query_groups(onpolicy_groups), is_replay=False)
-    if onpolicy_batch is not None:
-        chunks.append(onpolicy_batch)
-
-    if not chunks:
+    replay_chunks = [group.data for group in replay_groups]
+    onpolicy_chunks = [group.data for group in onpolicy_groups]
+    merged = _concat_dataprotos(replay_chunks + onpolicy_chunks)
+    if merged is None:
         return None
-    if len(chunks) == 1:
-        return chunks[0]
-    return DataProto.concat(chunks)
+    replay_prefix_size = sum(len(group.data) for group in replay_groups)
+    return _attach_replay_source_flag_once(merged, replay_prefix_size=replay_prefix_size)
