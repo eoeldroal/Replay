@@ -1044,3 +1044,292 @@ Package B는 우변을 키우는 패키지가 아니다.
 
 다만 현재 구현처럼 replay가 baseline-b384보다 과하게 느린 상태를,
 **비교 가능한 수준까지 끌어내리는 데는 가장 정당한 1차 패키지**라고 볼 수 있다.
+
+## 17. 2026-03-09 Package B 적용 현황
+
+이번 라운드에서는 의미 변화가 작은 항목만 우선 반영했다.
+
+적용 완료:
+- `logging.dump_full_scores`의 기본값을 `False`로 변경
+- batched replay log-prob 평가 전에 그룹 길이 workload 기준 내부 재정렬, 평가 후 원래 그룹 순서 복원
+- `zvp_recency` 사용 시 ingress 시점 ZVP eager initialization 적용
+- selection 직전 buffer-wide ZVP backfill은 resume된 legacy buffer에만 한정
+- 최종 `actor_batch` 생성 후 baseline-style attention-length rebalance 적용
+- `actor_batch` 기준 길이/토큰/소스 분해 메트릭 추가
+
+의도적으로 보류:
+- accepted replay의 runtime ZVP 계산/EMA 갱신 제거 또는 debug-only화
+- selection policy 자체를 바꾸는 cheap prefilter / approximate tau guard / scan budget
+- actor dynamic batch 사용 (`actor.use_dynamic_bsz`) 기반 최적화
+
+즉 현재 반영분은 replay selection 의미와 PPO loss 의미를 유지한 채, baseline `verl`의 실행 철학(batch balancing, 큰 batched call, hot-path 정리)을 replay 경로에 부분 복원하는 보수형 Package B이다.
+
+## 18. 중반부 안정 구간 기준의 추가 최적화 검토
+
+이번 절에서는 극초반/극후반을 제외하고, 실제로 replay가 안정적으로 활성화되는 중반부 구간에서 무엇이 병목인지 다시 본다.
+이 구간은 "현재 알고리즘이 정상적으로 돌아가고 있다"는 전제 아래 비용 구조를 보기 좋기 때문에, 작은 로직 변경으로 큰 절감을 노릴 때 기준점으로 적합하다.
+
+### 18.1 기준 로그와 대표 수치
+
+이번 비교에는 아래 구간을 사용했다.
+
+- Qwen3 rev9 replay mid: step 79~80
+- Qwen2.5 main replay mid: step 157~160
+- Qwen2.5 baseline-b384 mid: step 114~120
+
+요약 평균은 아래와 같다.
+
+1. **Qwen3 rev9 replay mid**
+   - `timing_s/gen ≈ 201.6s`
+   - `timing_s/m2_build_actor_batch ≈ 156.7s`
+   - `timing_s/actor_update_policy_compute ≈ 120.1s`
+   - `timing_s/step ≈ 502.8s`
+   - `scanned_groups ≈ 864`
+   - `acceptance_rate ≈ 0.148`
+   - `replay_used = 128`
+
+2. **Qwen2.5 replay mid**
+   - `timing_s/gen ≈ 37.1s`
+   - `timing_s/m2_build_actor_batch ≈ 51.3s`
+   - `timing_s/actor_update_policy_compute ≈ 64.9s`
+   - `timing_s/step ≈ 164.9s`
+   - `scanned_groups ≈ 192`
+   - `acceptance_rate ≈ 0.667`
+   - `replay_used = 128`
+
+3. **Qwen2.5 baseline-b384 mid**
+   - `timing_s/gen ≈ 54.5s`
+   - `timing_s/m2_build_actor_batch ≈ 0.09s`
+   - `timing_s/actor_update_policy_compute ≈ 37.3s`
+   - `timing_s/step ≈ 109.6s`
+
+### 18.2 중반부에서 드러나는 구조적 차이
+
+이 수치가 보여 주는 바는 명확하다.
+
+1. **Qwen3 중반부의 주병목은 selection exact eval이다.**
+   - generation이 여전히 가장 크지만, `m2_build_actor_batch`가 이미 156초 수준이다.
+   - 그 중 핵심은 `m2_select_logprob_eval ≈ 108.5s`이다.
+   - acceptance가 0.148 수준이라, 128개를 채우기 위해 864개를 훑고 있다.
+   - 즉 이 구간은 "selection 의미는 정상적으로 작동하지만, exact 검증 비용이 지나치게 크다"는 상태다.
+
+2. **Qwen2.5 중반부의 주병목은 mixed actor update penalty다.**
+   - selection/build는 51초 수준으로 분명 크지만, Qwen3만큼 비정상적으로 크지는 않다.
+   - 반면 `actor_update_policy_compute`가 baseline-b384의 37초 대비 65초 수준으로 커진다.
+   - 즉 Qwen2.5에서는 중반부부터 이미 selection보다 actor mixed batch penalty가 더 중요한 병목이 된다.
+
+3. **따라서 모델별로 mid-stage 최적화의 초점이 다르다.**
+   - Qwen3: exact candidate 검증량을 줄여야 한다.
+   - Qwen2.5: final actor batch의 token workload를 더 baseline스럽게 만들어야 한다.
+
+### 18.3 중반부에서만 보면, 어떤 로직 변화가 상대적으로 정당한가
+
+중반부 안정 구간에서는 다음 조건이 동시에 성립한다.
+
+1. replay는 이미 128개를 채우고 있다.
+2. acceptance는 step-to-step로 폭발적으로 흔들리지 않는다.
+3. candidate score 분포도 초반보다 훨씬 안정적이다.
+4. stale tail 전체를 끝까지 보는 이득보다, 상위권 후보를 빠르게 확정하는 이득이 커진다.
+
+즉 이 구간에서는 극초반처럼 recall을 최우선으로 둘 필요가 덜하고,
+극후반처럼 utility가 거의 없는 sample에 끝까지 매달릴 이유도 적다.
+따라서 **"상위권 후보에 계산을 집중하는 작은 logic shift"**가 가장 정당화되기 쉽다.
+
+## 19. 로직 변경량 대비 최적화 효과 지표
+
+기존 RI는 보수형 최적화에 적합했다.
+이번에는 중반부에서 "조금 로직을 건드려도 되는" 후보를 비교하기 위해 아래 보조 지표를 둔다.
+
+- `LCS`: logic change score (1~5, 높을수록 의미 변화 큼)
+- `MGS`: mid-stage gain score (1~5, 중반부 step time 절감 잠재력)
+- `RS`: robustness score (1~5, early/late로 일반화될 가능성)
+- `RMR = (MGS × RS) / LCS`
+
+여기서 높은 `RMR`은
+- 로직 변경량이 상대적으로 작고
+- 중반부 절감이 크며
+- 실험 결과 해석도 비교적 쉬운 후보
+를 뜻한다.
+
+### 19.1 후보별 평가
+
+| 후보 | LCS | MGS | RS | RMR | 판단 |
+|---|---:|---:|---:|---:|---|
+| top-N prefilter 후 exact eval | 2 | 5 | 4 | 10.0 | 가장 유력 |
+| adaptive exact-eval budget (mid-stage only) | 2 | 4 | 3 | 6.0 | 유력 |
+| recent-accepted cache / lazy recheck | 3 | 4 | 3 | 4.0 | 조건부 유력 |
+| replay target 128 -> adaptive lower target | 3 | 3 | 3 | 3.0 | 보조 수단 |
+| replay length cap / long-tail suppression | 3 | 4 | 2 | 2.7 | actor 쪽 한정 |
+| async or overlapped selection | 4 | 5 | 3 | 3.8 | 강력하지만 구현 리스크 큼 |
+
+### 19.2 해석
+
+1. **top-N prefilter 후 exact eval**
+   - 가장 추천된다.
+   - 핵심은 candidate ordering을 완전히 바꾸는 것이 아니라,
+     replay score 상위권 N개만 exact `new_log_prob`/M2 검증 대상으로 보내는 것이다.
+   - 중반부에는 score 분포가 이미 안정적이므로, 이 방식이 전체 selection semantics를 크게 흔들지 않으면서 exact eval량을 크게 줄일 가능성이 높다.
+
+2. **adaptive exact-eval budget**
+   - 최근 acceptance EMA를 이용해 "이번 step에 대략 몇 개를 보면 128개를 채울 가능성이 높은가"를 계산하고, 그보다 약간 큰 budget만 본다.
+   - 예를 들어 Qwen2.5 mid-stage에서 acceptance가 0.667이면, 192개를 보는 현재 구조는 이미 상당히 효율적이다.
+   - 반면 Qwen3 mid-stage는 acceptance가 0.148이므로, budget만 바로 줄이면 fill 실패 리스크가 있다.
+   - 따라서 이 방식은 prefilter와 함께 갈 때 더 강해진다.
+
+3. **recent-accepted cache / lazy recheck**
+   - age가 매우 작고, 직전 step에서 이미 tau-safe였던 group은 exact M2 재평가를 매번 하지 않고 제한적으로 재확인하는 방식이다.
+   - 중반부에는 drift가 상대적으로 완만하므로, 극초반/극후반보다 정당화가 쉽다.
+   - 다만 이건 tau safety semantics에 가장 직접적으로 손을 대므로, 로직 변경량은 prefilter보다 크다.
+
+4. **adaptive replay target**
+   - 중반부에서 replay 128개를 반드시 채우는 것이 아니라, selection/build 또는 actor penalty가 과할 때 target을 96 또는 64로 낮추는 방식이다.
+   - 속도는 분명 줄겠지만, 학습 signal 자체도 줄어든다.
+   - 따라서 1차 수단보다는 보조 수단이다.
+
+5. **replay length cap / long-tail suppression**
+   - actor mixed batch penalty를 줄이는 데는 효과가 있을 수 있다.
+   - 다만 이는 selection score와 별개로 replay sample 분포를 바꾸므로, learning dynamics 해석이 약간 더 어려워진다.
+
+6. **async / overlapped selection**
+   - 시스템적으로는 매우 강력할 수 있다.
+   - 하지만 replay path를 training critical path 밖으로 빼는 설계라 구현 리스크와 디버깅 난도가 크다.
+   - 현재 단계에서는 Stage 3에 가깝다.
+
+## 20. 중반부 기준의 실질 추천안
+
+중반부 안정 구간만 놓고 보면, 가장 현실적인 강공책은 아래 2단계다.
+
+### 20.1 Stage 2A: 로직 변화가 작고 이득이 큰 조합
+
+1. **top-N prefilter 후 exact eval**
+   - 기본 score ordering은 유지
+   - exact `new_log_prob`/M2는 상위 N개에만 수행
+   - N은 recent acceptance와 replay target을 바탕으로 적응적으로 잡음
+
+2. **adaptive exact-eval budget**
+   - 최근 몇 step의 acceptance EMA를 이용해 scan cap을 계산
+   - cap은 보수적으로, 예: `target / max(ema_acceptance, floor)`의 1.2~1.5배 정도
+
+이 조합의 핵심은,
+- "후보를 아예 다른 기준으로 고르는 것"이 아니라
+- "상위권 후보에 계산을 집중한다"는 점이다.
+
+중반부에서는 이 방향이 특히 정당하다.
+왜냐하면,
+- replay는 이미 안정적으로 사용되고 있고
+- 상위권 score 신뢰도가 높아졌으며
+- full-buffer recall보다 exact eval 비용이 더 큰 문제가 되기 때문이다.
+
+### 20.2 Stage 2B: actor penalty 완화용 보조책
+
+1. final `actor_batch` rebalance 이후에도
+2. replay 쪽 길이 tail이 계속 actor penalty를 키우면,
+3. 중반부에 한해 replay sample length 상한 또는 long-tail downweight를 추가 검토할 수 있다.
+
+다만 이건 selection 의미를 직접 건드리기 시작하므로,
+- Stage 2A 이후에도 actor update가 여전히 주 병목일 때만 들어가는 것이 맞다.
+
+## 21. 현 시점의 최종 추천
+
+현재 기준으로는 아래 순서가 가장 정당하다.
+
+1. **Package B 적용 효과를 먼저 재측정**
+   - actor_batch rebalance와 selection superchunking으로 얼마나 내려가는지 확인
+
+2. **그 다음 중반부 전용 Stage 2A를 검토**
+   - top-N prefilter
+   - adaptive exact-eval budget
+
+3. **그래도 actor mixed penalty가 크면 Stage 2B 검토**
+   - replay length-tail 억제 또는 target 조정
+
+즉, 지금 가장 설득력 있는 다음 단계는
+**"selection 의미를 바꾸지 않는 보수형 Package B" 다음으로,
+"중반부에서만 상위권 후보에 exact 계산을 집중하는 작은 logic shift"**이다.
+
+
+## Refined Plan For Two Hotspots (Docs + Code Referenced)
+
+### What the upstream VERL codebase optimizes for
+- `docs/perf/perf_tuning.rst` emphasizes that dynamic batch size is for **forward/backward throughput** (`compute_log_prob`, `update_policy`, etc.), not for Python/DataProto manipulation.
+- `verl/trainer/ppo/ray_trainer.py::_balance_batch` shows VERL's preferred pattern: **batch-first**, reorder once, then run heavy compute.
+- `verl/protocol.py` exposes `DataProto.select`, `select_idxs`, and `concat` as the intended abstraction boundary.
+
+### Implication for our two hotspots
+These two timers are mostly **pre-forward batch construction costs**, so the stable way to optimize them is not to add new algorithmic heuristics but to restore VERL's batch-first style in the replay path.
+
+### Hotspot 1: `m2_prepare_onpolicy_groups`
+Current cost source:
+- `build_query_groups_from_onpolicy_batch(...)` computes success stats from the full batch, then for each accepted candidate does:
+  - `raw_group = batch[idxs]`
+  - `actor_group = select_actor_training_view(raw_group)`
+- This creates two DataProto materializations per accepted ingress group.
+
+Refined implementation plan:
+1. Build `actor_view_batch = select_actor_training_view(batch)` once.
+2. Keep success-stat computation on the full batch unchanged.
+3. For accepted candidates, materialize groups directly as `actor_view_batch[idxs]`.
+4. Keep the return schema (`GroupBuildResult`, `QueryGroup`) unchanged.
+5. Add sub-timers for success-stat / materialize / zvp.
+
+Why this is aligned with VERL:
+- Reuses `DataProto.select` and `select_idxs` instead of custom low-level slicing.
+- Preserves trainer-orchestrates / helper-materializes structure.
+- Converts repeated view-building into one shared view + many cheap index selections.
+
+### Hotspot 2: `m2_actor_batch_concat`
+Current cost source:
+- Build replay batch by concatenating replay groups.
+- Attach replay-source flag to replay batch and on-policy batch separately.
+- Concatenate replay batch and on-policy batch again.
+- This means two large concat passes plus two flag-attach reconstructions.
+
+Refined implementation plan:
+1. Build `onpolicy_actor_batch = select_actor_training_view(onpolicy_batch)` once.
+2. Collect replay group DataProto chunks and the on-policy actor batch into one list.
+3. Call `DataProto.concat(...)` once for the final batch.
+4. Attach `m2_replay_source` once on the final batch using known replay prefix length.
+5. Preserve replay-first ordering so downstream behavior stays unchanged.
+
+Why this is aligned with VERL:
+- Still uses `DataProto.concat` as the abstraction boundary.
+- Avoids introducing custom TensorDict concatenation logic too early.
+- Follows batch-first assembly: prepare final big batch once, then annotate once.
+
+### Recommended sequence
+1. Implement the shared actor-view fast path in `m2_prepare_onpolicy_groups`.
+2. Implement one-shot final concat in `m2_actor_batch_concat`.
+3. Add sub-timers and actor-batch metrics to validate where the savings actually come from.
+4. Only if still needed, consider more invasive phase-2 changes (conditional `uid` drop, specialized concat builder).
+
+### Logic-Change vs Gain Estimate
+- Shared actor-view fast path: low logic change, medium/high gain.
+- One-shot final concat: low logic change, medium gain.
+- Conditional `uid` drop: medium logic change, low/medium gain.
+- Specialized custom concat builder bypassing `DataProto.concat`: medium/high logic change, uncertain gain; defer.
+
+## GPU-side M2 Fast Path And Runtime-ZVP Config
+
+- Replay selection에 대해 worker/GPU에서 `fresh log-prob + grouped M2`를 한 번에 계산하는 fast path를 추가했다.
+- 구현 위치:
+  - `/home/work/DDAI_revised/verl/verl/workers/fsdp_workers.py`
+  - `/home/work/DDAI_revised/verl/verl/trainer/ppo/ray_trainer.py`
+  - `/home/work/DDAI_revised/verl/verl/trainer/ppo/m2_replay.py`
+- 핵심 변화:
+  - 기존: worker에서 `new_log_probs`를 CPU로 내린 뒤, driver가 `stack + M2`를 다시 계산
+  - 변경 후: legacy FSDP worker가 `compute_log_prob_m2(...)` RPC로 group별 M2 scalar를 직접 반환
+- 이 fast path는 selection 의미를 바꾸지 않고, CPU 쪽 `m2_select_m2_eval`과 `new_log_probs` 전송 부담을 줄이는 데 목적이 있다.
+
+### 새 설정
+- `algorithm.m2_replay.selection.compute_runtime_zvp=false`
+  - training 기본값을 `False`로 둔다.
+  - runtime ZVP는 선택 의미보다 debug/EMA 갱신 성격이 강하므로, hot path 기본값에서는 끈다.
+- `algorithm.m2_replay.selection.gpu_m2_fastpath=true`
+  - training 기본값을 `True`로 둔다.
+  - 단, 현재는 legacy FSDP worker 경로에서만 활성화되고, new engine path에서는 자동으로 CPU M2 fallback을 탄다.
+
+### 새 테스트
+- `/home/work/DDAI_revised/verl/tests/trainer/ppo/test_m2_replay_gpu_m2_fastpath_on_cpu.py`
+  - 기존 chunked CPU 경로와 fast path의 선택 결과가 같은지 검증
+  - `runtime ZVP` 비활성 시 debug payload에 runtime ZVP 필드가 생기지 않는지 검증
+  - fast path 실패 시 기존 batch log-prob 경로로 fallback되는지 검증
