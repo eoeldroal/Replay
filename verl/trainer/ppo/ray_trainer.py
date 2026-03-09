@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import time
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -62,9 +63,13 @@ from verl.trainer.ppo.m2_replay_adapter import (
     build_actor_batch_from_groups,
     build_actor_batch_with_replay,
     build_query_groups_from_onpolicy_batch,
+    compute_actor_batch_metrics,
     derive_ingress_success_band,
     filter_query_groups_for_ingress,
     normalize_ingress_filter_mode,
+    rebalance_batch_by_attention,
+    reorder_group_data_for_logprob_eval,
+    restore_group_output_order,
     split_query_groups_by_adv_zero,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
@@ -470,8 +475,12 @@ class RayPPOTrainer:
         self.m2_replay_zvp_lambda_neg = 1.0
         self.m2_replay_zvp_use_recency = True
         self.m2_replay_zvp_mode = "sign_only"
+        self.m2_replay_compute_runtime_zvp = False
+        self.m2_replay_gpu_m2_fastpath = True
         self.m2_replay_logprob_groups_per_chunk = 1
         self.m2_replay_log_prob_micro_batch_size_per_gpu: Optional[int] = None
+        self.m2_replay_log_prob_use_dynamic_bsz: Optional[bool] = None
+        self.m2_replay_log_prob_max_token_len_per_gpu: Optional[int] = None
         self.m2_replay_dump_full_scores = False
         self.m2_replay_full_scores_dir: Optional[str] = None
         self.m2_replay_training_mode = "legacy_bonus"
@@ -481,6 +490,7 @@ class RayPPOTrainer:
         self.m2_replay_one_turnover_gate = False
         self.m2_replay_adv_zero_eps = 1e-8
         self.m2_replay_buffer: Optional[QueryGroupReplayBuffer] = None
+        self.m2_replay_needs_buffer_zvp_backfill = False
         self.m2_replay_query_use_count: dict[str, int] = defaultdict(int)
 
         if self.m2_replay_enabled:
@@ -531,12 +541,21 @@ class RayPPOTrainer:
             self.m2_replay_zvp_use_recency = bool(selection_cfg.get("zvp_use_recency", True))
             zvp_mode_raw = str(selection_cfg.get("zvp_mode", "sign_only"))
             self.m2_replay_zvp_mode = normalize_zvp_mode(zvp_mode_raw)
+            self.m2_replay_compute_runtime_zvp = bool(selection_cfg.get("compute_runtime_zvp", False))
+            self.m2_replay_gpu_m2_fastpath = bool(selection_cfg.get("gpu_m2_fastpath", True))
             if self.m2_replay_zvp_mode != zvp_mode_raw.strip().lower():
                 print(
                     f"[m2_replay] Warning: unknown selection.zvp_mode={zvp_mode_raw}. "
                     "Fallback to sign_only.",
                     flush=True,
                 )
+            if self.use_legacy_worker_impl == "disable" and self.m2_replay_gpu_m2_fastpath:
+                print(
+                    "[m2_replay] Warning: selection.gpu_m2_fastpath=true is currently only wired for legacy "
+                    "FSDP worker path. Falling back to CPU-side M2 on the new engine path.",
+                    flush=True,
+                )
+                self.m2_replay_gpu_m2_fastpath = False
             self.m2_replay_logprob_groups_per_chunk = max(int(selection_cfg.get("logprob_groups_per_chunk", 1)), 1)
             log_prob_micro_batch_size_cfg = selection_cfg.get("log_prob_micro_batch_size_per_gpu", None)
             if log_prob_micro_batch_size_cfg is None:
@@ -548,6 +567,35 @@ class RayPPOTrainer:
                         "[m2_replay] selection.log_prob_micro_batch_size_per_gpu must be > 0 when provided."
                     )
                 self.m2_replay_log_prob_micro_batch_size_per_gpu = parsed_log_prob_micro_batch_size
+            log_prob_use_dynamic_bsz_cfg = selection_cfg.get("log_prob_use_dynamic_bsz", None)
+            if log_prob_use_dynamic_bsz_cfg is None:
+                self.m2_replay_log_prob_use_dynamic_bsz = None
+            else:
+                self.m2_replay_log_prob_use_dynamic_bsz = bool(log_prob_use_dynamic_bsz_cfg)
+            log_prob_max_token_cfg = selection_cfg.get("log_prob_max_token_len_per_gpu", None)
+            if log_prob_max_token_cfg is None:
+                self.m2_replay_log_prob_max_token_len_per_gpu = None
+            else:
+                parsed_log_prob_max_token = int(log_prob_max_token_cfg)
+                if parsed_log_prob_max_token <= 0:
+                    raise ValueError(
+                        "[m2_replay] selection.log_prob_max_token_len_per_gpu must be > 0 when provided."
+                    )
+                self.m2_replay_log_prob_max_token_len_per_gpu = parsed_log_prob_max_token
+            if (
+                self.use_legacy_worker_impl == "disable"
+                and (
+                    self.m2_replay_log_prob_use_dynamic_bsz is not None
+                    or self.m2_replay_log_prob_max_token_len_per_gpu is not None
+                )
+            ):
+                print(
+                    "[m2_replay] Warning: selection-only log-prob batching overrides are currently only wired "
+                    "for the legacy FSDP worker path. Falling back to rollout log-prob config on the new engine path.",
+                    flush=True,
+                )
+                self.m2_replay_log_prob_use_dynamic_bsz = None
+                self.m2_replay_log_prob_max_token_len_per_gpu = None
             training_mode_raw = str(self.m2_replay_cfg.get("training_mode", "legacy_bonus")).strip().lower()
             valid_training_modes = {"legacy_bonus", "fixed_total_with_adv0_drop"}
             if training_mode_raw not in valid_training_modes:
@@ -587,7 +635,7 @@ class RayPPOTrainer:
             self.m2_replay_start_mode = start_mode_raw
             self.m2_replay_one_turnover_gate = self.m2_replay_start_mode == "two_turnovers"
             self.m2_replay_prefix = str(logging_cfg.get("prefix", "m2_replay"))
-            self.m2_replay_dump_full_scores = bool(logging_cfg.get("dump_full_scores", True))
+            self.m2_replay_dump_full_scores = bool(logging_cfg.get("dump_full_scores", False))
             custom_full_scores_dir = logging_cfg.get("full_scores_dir", None)
             if custom_full_scores_dir is None or str(custom_full_scores_dir).strip() == "":
                 base_full_scores_dir = os.path.join(self.config.trainer.default_local_dir, "m2_replay_full_scores")
@@ -1388,6 +1436,12 @@ class RayPPOTrainer:
             if os.path.exists(replay_state_local_path):
                 replay_state = torch.load(replay_state_local_path, weights_only=False)
                 self.m2_replay_buffer.load_state_dict(replay_state)
+                self.m2_replay_needs_buffer_zvp_backfill = bool(
+                    self.m2_replay_selection_mode == "zvp_recency"
+                    and any(
+                        int(getattr(group, "zvp_update_count", 0)) <= 0 for group in self.m2_replay_buffer.items()
+                    )
+                )
                 print(
                     f"[m2_replay] Restored replay state from {replay_state_local_path} "
                     f"(size={len(self.m2_replay_buffer)})"
@@ -1397,6 +1451,7 @@ class RayPPOTrainer:
                     f"[m2_replay] Warning: replay state file not found at {replay_state_local_path}. "
                     "Starting with an empty replay buffer."
                 )
+                self.m2_replay_needs_buffer_zvp_backfill = False
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
@@ -1559,6 +1614,8 @@ class RayPPOTrainer:
         batch: DataProto,
         calculate_entropy: bool = True,
         log_prob_micro_batch_size_override: Optional[int] = None,
+        log_prob_use_dynamic_bsz_override: Optional[bool] = None,
+        log_prob_max_token_len_override: Optional[int] = None,
     ):
         if self.use_legacy_worker_impl == "disable":
             # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
@@ -1570,6 +1627,10 @@ class RayPPOTrainer:
             assign_kwargs: dict[str, object] = {"calculate_entropy": calculate_entropy, "compute_loss": False}
             if log_prob_micro_batch_size_override is not None:
                 assign_kwargs["log_prob_micro_batch_size_override"] = int(log_prob_micro_batch_size_override)
+            if log_prob_use_dynamic_bsz_override is not None:
+                assign_kwargs["log_prob_use_dynamic_bsz_override"] = bool(log_prob_use_dynamic_bsz_override)
+            if log_prob_max_token_len_override is not None:
+                assign_kwargs["log_prob_max_token_len_override"] = int(log_prob_max_token_len_override)
             tu.assign_non_tensor(batch_td, **assign_kwargs)
             output = self.actor_rollout_wg.compute_log_prob(batch_td)
             # gather output
@@ -1589,6 +1650,10 @@ class RayPPOTrainer:
         else:
             if log_prob_micro_batch_size_override is not None:
                 batch.meta_info["log_prob_micro_batch_size_override"] = int(log_prob_micro_batch_size_override)
+            if log_prob_use_dynamic_bsz_override is not None:
+                batch.meta_info["log_prob_use_dynamic_bsz_override"] = bool(log_prob_use_dynamic_bsz_override)
+            if log_prob_max_token_len_override is not None:
+                batch.meta_info["log_prob_max_token_len_override"] = int(log_prob_max_token_len_override)
             batch.meta_info["calculate_entropy"] = bool(calculate_entropy)
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
             old_log_prob_mfu = 0
@@ -1719,6 +1784,8 @@ class RayPPOTrainer:
             group_data,
             calculate_entropy=False,
             log_prob_micro_batch_size_override=self.m2_replay_log_prob_micro_batch_size_per_gpu,
+            log_prob_use_dynamic_bsz_override=self.m2_replay_log_prob_use_dynamic_bsz,
+            log_prob_max_token_len_override=self.m2_replay_log_prob_max_token_len_per_gpu,
         )
         return new_log_prob_dp.batch["old_log_probs"]
 
@@ -1726,17 +1793,20 @@ class RayPPOTrainer:
         if not group_data_list:
             return []
 
-        merged_group_data = DataProto.concat(group_data_list)
+        reordered_group_data, eval_order = reorder_group_data_for_logprob_eval(group_data_list)
+        merged_group_data = DataProto.concat(reordered_group_data)
         merged_new_log_prob_dp, _ = self._compute_old_log_prob(
             merged_group_data,
             calculate_entropy=False,
             log_prob_micro_batch_size_override=self.m2_replay_log_prob_micro_batch_size_per_gpu,
+            log_prob_use_dynamic_bsz_override=self.m2_replay_log_prob_use_dynamic_bsz,
+            log_prob_max_token_len_override=self.m2_replay_log_prob_max_token_len_per_gpu,
         )
         merged_new_log_probs = merged_new_log_prob_dp.batch["old_log_probs"]
 
         split_new_log_probs: list[torch.Tensor] = []
         start = 0
-        for group_data in group_data_list:
+        for group_data in reordered_group_data:
             if group_data.batch is None or "old_log_probs" not in group_data.batch.keys():
                 raise ValueError("group_data.batch must contain old_log_probs for batched replay logprob evaluation.")
             group_len = int(group_data.batch["old_log_probs"].shape[0])
@@ -1750,7 +1820,44 @@ class RayPPOTrainer:
                 f"consumed={start}, total={int(merged_new_log_probs.shape[0])}."
             )
 
-        return split_new_log_probs
+        return restore_group_output_order(split_new_log_probs, eval_order)
+
+    def _m2_compute_group_m2_batch(self, group_data_list: list[DataProto]) -> list[float]:
+        if not group_data_list:
+            return []
+
+        reordered_group_data, eval_order = reorder_group_data_for_logprob_eval(group_data_list)
+        merged_group_data = DataProto.concat(reordered_group_data)
+        group_lengths = []
+        for group_data in reordered_group_data:
+            if group_data.batch is None or "old_log_probs" not in group_data.batch.keys():
+                raise ValueError("group_data.batch must contain old_log_probs for replay GPU M2 evaluation.")
+            group_lengths.append(int(group_data.batch["old_log_probs"].shape[0]))
+
+        merged_group_data.meta_info["m2_group_lengths"] = group_lengths
+        merged_group_data.meta_info["compute_runtime_zvp"] = False
+        if self.m2_replay_log_prob_micro_batch_size_per_gpu is not None:
+            merged_group_data.meta_info["log_prob_micro_batch_size_override"] = int(
+                self.m2_replay_log_prob_micro_batch_size_per_gpu
+            )
+        if self.m2_replay_log_prob_use_dynamic_bsz is not None:
+            merged_group_data.meta_info["log_prob_use_dynamic_bsz_override"] = bool(
+                self.m2_replay_log_prob_use_dynamic_bsz
+            )
+        if self.m2_replay_log_prob_max_token_len_per_gpu is not None:
+            merged_group_data.meta_info["log_prob_max_token_len_override"] = int(
+                self.m2_replay_log_prob_max_token_len_per_gpu
+            )
+
+        output = self.actor_rollout_wg.compute_log_prob_m2(merged_group_data)
+        m2_tensor = output.batch["m2"]
+        if int(m2_tensor.shape[0]) != len(reordered_group_data):
+            raise ValueError(
+                "compute_log_prob_m2 must return one M2 scalar per group, "
+                f"got {int(m2_tensor.shape[0])} for {len(reordered_group_data)} groups."
+            )
+        m2_list = [float(value) for value in m2_tensor.detach().cpu().tolist()]
+        return restore_group_output_order(m2_list, eval_order)
 
     def _m2_build_actor_batch(
         self,
@@ -1790,10 +1897,9 @@ class RayPPOTrainer:
                 rollout_n=rollout_n,
                 ingress_filter_mode=self.m2_replay_ingress_filter_mode,
             )
-            should_init_onpolicy_zvp = (
-                self.m2_replay_start_mode == "immediate" and self.m2_replay_selection_mode == "zvp_recency"
-            )
+            should_init_onpolicy_zvp = self.m2_replay_selection_mode == "zvp_recency"
             if self.m2_replay_training_mode == "fixed_total_with_adv0_drop":
+                _t0 = time.perf_counter()
                 group_build_result = build_query_groups_from_onpolicy_batch(
                     batch=batch,
                     expected_group_size=rollout_n,
@@ -1802,6 +1908,7 @@ class RayPPOTrainer:
                     zvp_mode=self.m2_replay_zvp_mode,
                     compute_zvp_stats=False,
                 )
+                m2_timing_raw["m2_prepare_group_build"] = m2_timing_raw.get("m2_prepare_group_build", 0.0) + (time.perf_counter() - _t0)
                 onpolicy_all_groups = group_build_result.groups
                 onpolicy_ingress_groups, skipped_by_success_band = filter_query_groups_for_ingress(
                     groups=onpolicy_all_groups,
@@ -1809,13 +1916,16 @@ class RayPPOTrainer:
                     ingress_filter_mode=self.m2_replay_ingress_filter_mode,
                 )
                 if should_init_onpolicy_zvp and onpolicy_ingress_groups:
+                    _t0 = time.perf_counter()
                     update_query_groups_zvp_stats(
                         onpolicy_ingress_groups,
                         lambda_neg=self.m2_replay_zvp_lambda_neg,
                         zvp_mode=self.m2_replay_zvp_mode,
                         update_step=int(self.global_steps),
                     )
+                    m2_timing_raw["m2_prepare_zvp_init"] = m2_timing_raw.get("m2_prepare_zvp_init", 0.0) + (time.perf_counter() - _t0)
             else:
+                _t0 = time.perf_counter()
                 group_build_result = build_query_groups_from_onpolicy_batch(
                     batch=batch,
                     expected_group_size=rollout_n,
@@ -1824,11 +1934,21 @@ class RayPPOTrainer:
                     success_count_max=ingress_success_count_max,
                     zvp_lambda_neg=self.m2_replay_zvp_lambda_neg,
                     zvp_mode=self.m2_replay_zvp_mode,
-                    compute_zvp_stats=should_init_onpolicy_zvp,
+                    compute_zvp_stats=False,
                 )
+                m2_timing_raw["m2_prepare_group_build"] = m2_timing_raw.get("m2_prepare_group_build", 0.0) + (time.perf_counter() - _t0)
                 onpolicy_ingress_groups = group_build_result.groups
                 skipped_by_success_band = group_build_result.skipped_by_success_band
                 onpolicy_all_groups = onpolicy_ingress_groups
+                if should_init_onpolicy_zvp and onpolicy_ingress_groups:
+                    _t0 = time.perf_counter()
+                    update_query_groups_zvp_stats(
+                        onpolicy_ingress_groups,
+                        lambda_neg=self.m2_replay_zvp_lambda_neg,
+                        zvp_mode=self.m2_replay_zvp_mode,
+                        update_step=int(self.global_steps),
+                    )
+                    m2_timing_raw["m2_prepare_zvp_init"] = m2_timing_raw.get("m2_prepare_zvp_init", 0.0) + (time.perf_counter() - _t0)
 
         metrics[self._m2_key("buffer/new_groups")] = float(len(onpolicy_ingress_groups))
         metrics[self._m2_key("buffer/skipped_incomplete")] = float(group_build_result.skipped_incomplete)
@@ -1892,6 +2012,25 @@ class RayPPOTrainer:
             else int(self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu)
         )
         metrics[self._m2_key("selection/log_prob_micro_batch_size_per_gpu")] = float(effective_log_prob_micro_batch)
+        effective_log_prob_dynamic_bsz = (
+            self.m2_replay_log_prob_use_dynamic_bsz
+            if self.m2_replay_log_prob_use_dynamic_bsz is not None
+            else self.config.actor_rollout_ref.rollout.log_prob_use_dynamic_bsz
+        )
+        metrics[self._m2_key("selection/log_prob_use_dynamic_bsz")] = float(bool(effective_log_prob_dynamic_bsz))
+        effective_log_prob_max_token_len = (
+            self.m2_replay_log_prob_max_token_len_per_gpu
+            if self.m2_replay_log_prob_max_token_len_per_gpu is not None
+            else self.config.actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu
+        )
+        if effective_log_prob_max_token_len is not None:
+            metrics[self._m2_key("selection/log_prob_max_token_len_per_gpu")] = float(
+                int(effective_log_prob_max_token_len)
+            )
+        metrics[self._m2_key("selection/runtime_zvp_enabled")] = float(bool(self.m2_replay_compute_runtime_zvp))
+        metrics[self._m2_key("selection/gpu_m2_fastpath_enabled")] = float(
+            bool(self.m2_replay_gpu_m2_fastpath and self.use_legacy_worker_impl != "disable")
+        )
 
         buffer_size_pre_select = len(self.m2_replay_buffer)
         buffer_capacity = int(self.m2_replay_buffer.max_query_groups)
@@ -1936,13 +2075,14 @@ class RayPPOTrainer:
                     rejected_eval_error=0,
                 )
             else:
-                if self.m2_replay_selection_mode == "zvp_recency":
+                if self.m2_replay_selection_mode == "zvp_recency" and self.m2_replay_needs_buffer_zvp_backfill:
                     backfilled_groups = update_query_groups_zvp_stats(
                         self.m2_replay_buffer.items(),
                         lambda_neg=self.m2_replay_zvp_lambda_neg,
                         zvp_mode=self.m2_replay_zvp_mode,
                         only_missing=True,
                     )
+                    self.m2_replay_needs_buffer_zvp_backfill = False
                     metrics[self._m2_key("gating/backfilled_buffer_groups")] = float(backfilled_groups)
                 else:
                     metrics[self._m2_key("gating/backfilled_buffer_groups")] = 0.0
@@ -1952,6 +2092,11 @@ class RayPPOTrainer:
                     tau=self.m2_replay_tau,
                     compute_new_log_probs_fn=self._m2_compute_new_log_probs,
                     compute_new_log_probs_batch_fn=self._m2_compute_new_log_probs_batch,
+                    compute_group_m2_batch_fn=(
+                        self._m2_compute_group_m2_batch
+                        if self.m2_replay_gpu_m2_fastpath and self.use_legacy_worker_impl != "disable"
+                        else None
+                    ),
                     max_scan=len(self.m2_replay_buffer),
                     current_step=int(self.global_steps),
                     selection_mode=self.m2_replay_selection_mode,
@@ -1962,6 +2107,7 @@ class RayPPOTrainer:
                     zvp_lambda_neg=self.m2_replay_zvp_lambda_neg,
                     zvp_use_recency=self.m2_replay_zvp_use_recency,
                     zvp_mode=self.m2_replay_zvp_mode,
+                    compute_runtime_zvp=self.m2_replay_compute_runtime_zvp,
                     groups_per_chunk=self.m2_replay_logprob_groups_per_chunk,
                     build_candidate_priority_all=self.m2_replay_dump_full_scores,
                     timing_raw=m2_timing_raw,
@@ -2186,6 +2332,15 @@ class RayPPOTrainer:
                     actor_batch = build_actor_batch_with_replay(onpolicy_batch=batch, replay_groups=[])
             else:
                 actor_batch = build_actor_batch_with_replay(onpolicy_batch=batch, replay_groups=replay_groups)
+        actor_dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+        metrics.update(
+            rebalance_batch_by_attention(
+                actor_batch,
+                k_partitions=actor_dp_size,
+                logging_prefix=self._m2_key("actor_batch_seqlen"),
+            )
+        )
+        metrics.update(compute_actor_batch_metrics(actor_batch, prefix=self._m2_key("actor_batch")))
         actor_batch.meta_info = dict(batch.meta_info)
         if actor_batch.batch is not None and "attention_mask" in actor_batch.batch.keys():
             actor_batch.meta_info["global_token_num"] = torch.sum(actor_batch.batch["attention_mask"], dim=-1).tolist()
