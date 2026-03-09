@@ -126,6 +126,39 @@ def get_sharding_strategy(device_mesh, zero3_enable=True):
     return sharding_strategy
 
 
+def _resolve_log_prob_batching_settings(meta_info: dict[str, Any], config_source: RolloutConfig) -> tuple[int, int, bool]:
+    micro_batch_size_override = meta_info.pop("log_prob_micro_batch_size_override", None)
+    if micro_batch_size_override is not None:
+        micro_batch_size_override = int(micro_batch_size_override)
+        if micro_batch_size_override <= 0:
+            raise ValueError("log_prob_micro_batch_size_override must be > 0.")
+
+    dynamic_bsz_override = meta_info.pop("log_prob_use_dynamic_bsz_override", None)
+    if dynamic_bsz_override is not None:
+        dynamic_bsz_override = bool(dynamic_bsz_override)
+
+    max_token_len_override = meta_info.pop("log_prob_max_token_len_override", None)
+    if max_token_len_override is not None:
+        max_token_len_override = int(max_token_len_override)
+        if max_token_len_override <= 0:
+            raise ValueError("log_prob_max_token_len_override must be > 0.")
+
+    micro_batch_size = (
+        micro_batch_size_override
+        if micro_batch_size_override is not None
+        else config_source.log_prob_micro_batch_size_per_gpu
+    )
+    max_token_len = (
+        max_token_len_override
+        if max_token_len_override is not None
+        else config_source.log_prob_max_token_len_per_gpu
+    )
+    use_dynamic_bsz = (
+        dynamic_bsz_override if dynamic_bsz_override is not None else config_source.log_prob_use_dynamic_bsz
+    )
+    return int(micro_batch_size), int(max_token_len), bool(use_dynamic_bsz)
+
+
 def get_vl_model_vision_tower(vl_model_instance):
     """
     Util to extract Vision Tower from a VL model instance
@@ -1028,18 +1061,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
         # we should always recompute old_log_probs when it is HybridEngine
         config_source = self.config.ref if is_lora else self.config.rollout
-        micro_batch_size_override = data.meta_info.pop("log_prob_micro_batch_size_override", None)
-        if micro_batch_size_override is not None:
-            micro_batch_size_override = int(micro_batch_size_override)
-            if micro_batch_size_override <= 0:
-                raise ValueError("log_prob_micro_batch_size_override must be > 0.")
-        data.meta_info["micro_batch_size"] = (
-            micro_batch_size_override
-            if micro_batch_size_override is not None
-            else config_source.log_prob_micro_batch_size_per_gpu
+        micro_batch_size, max_token_len, use_dynamic_bsz = _resolve_log_prob_batching_settings(
+            data.meta_info,
+            config_source,
         )
-        data.meta_info["max_token_len"] = config_source.log_prob_max_token_len_per_gpu
-        data.meta_info["use_dynamic_bsz"] = config_source.log_prob_use_dynamic_bsz
+        data.meta_info["micro_batch_size"] = micro_batch_size
+        data.meta_info["max_token_len"] = max_token_len
+        data.meta_info["use_dynamic_bsz"] = use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
         data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
         # perform recompute log_prob
@@ -1070,6 +1098,92 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=logger)
+
+        return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="blue", role="actor_compute_log_prob_m2")
+    def compute_log_prob_m2(self, data: DataProto):
+        """Replay-selection fast path.
+
+        Computes fresh log-probs and grouped M2 on the worker/GPU side, then
+        returns only per-group M2 scalars to the driver.
+        """
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        from contextlib import nullcontext
+
+        is_lora = data.meta_info.pop("is_lora", False)
+        if bool(data.meta_info.pop("compute_runtime_zvp", False)):
+            raise ValueError("compute_log_prob_m2 does not support runtime ZVP stats.")
+
+        group_lengths = data.meta_info.pop("m2_group_lengths", None)
+        if group_lengths is None:
+            raise ValueError("compute_log_prob_m2 requires meta_info['m2_group_lengths'].")
+        group_lengths = [int(length) for length in group_lengths]
+        if any(length <= 0 for length in group_lengths):
+            raise ValueError(f"m2_group_lengths must all be > 0, got {group_lengths}.")
+
+        adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
+        config_source = self.config.ref if is_lora else self.config.rollout
+        micro_batch_size, max_token_len, use_dynamic_bsz = _resolve_log_prob_batching_settings(
+            data.meta_info,
+            config_source,
+        )
+        data.meta_info["micro_batch_size"] = micro_batch_size
+        data.meta_info["max_token_len"] = max_token_len
+        data.meta_info["use_dynamic_bsz"] = use_dynamic_bsz
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
+
+        old_log_probs = data.batch["old_log_probs"]
+        response_mask = data.batch["response_mask"]
+        batch_rows = int(old_log_probs.shape[0])
+        if sum(group_lengths) != batch_rows:
+            raise ValueError(
+                "compute_log_prob_m2 group length mismatch: "
+                f"sum(group_lengths)={sum(group_lengths)} vs batch_rows={batch_rows}."
+            )
+
+        with self.ulysses_sharding_manager:
+            with adapter_ctx:
+                outputs = self.actor.compute_log_prob(data=data, calculate_entropy=False)
+            new_log_probs = outputs["log_probs"]
+            device = new_log_probs.device
+            old_log_probs = old_log_probs.to(device=device, dtype=torch.float32, non_blocking=True)
+            response_mask = response_mask.to(device=device, dtype=torch.float32, non_blocking=True)
+            new_log_probs = new_log_probs.to(dtype=torch.float32)
+
+            old_flat = old_log_probs.reshape(batch_rows, -1)
+            new_flat = new_log_probs.reshape(batch_rows, -1)
+            mask_flat = response_mask.reshape(batch_rows, -1)
+            row_num = ((new_flat - old_flat).square() * mask_flat).sum(dim=1)
+            row_denom = mask_flat.sum(dim=1)
+
+            group_m2 = []
+            start = 0
+            inf_value = row_num.new_tensor(float("inf"))
+            for group_length in group_lengths:
+                end = start + group_length
+                num = row_num[start:end].sum()
+                denom = row_denom[start:end].sum()
+                group_m2.append(torch.where(denom > 0, num / denom.clamp_min(1.0), inf_value))
+                start = end
+            output = DataProto.from_dict(
+                tensors={"m2": torch.stack(group_m2, dim=0)},
+                meta_info={"temperature": self.config.rollout.temperature},
+            )
+
+        output = output.to("cpu")
+
+        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+            self.actor.actor_module._handle.reshard(True)
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload actor model during compute_log_prob_m2", logger=logger)
 
         return output
 
