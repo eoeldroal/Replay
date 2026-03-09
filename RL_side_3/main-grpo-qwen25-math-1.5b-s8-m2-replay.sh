@@ -76,6 +76,10 @@ python3 -u -m verl.trainer.main_ppo \
     +algorithm.m2_replay.selection.zvp_ema_alpha=1.0 \
     +algorithm.m2_replay.selection.logprob_groups_per_chunk=64 \
     +algorithm.m2_replay.selection.log_prob_micro_batch_size_per_gpu=64 \
+    +algorithm.m2_replay.selection.log_prob_use_dynamic_bsz=true \
+    +algorithm.m2_replay.selection.log_prob_max_token_len_per_gpu=16384 \
+    +algorithm.m2_replay.selection.gpu_m2_fastpath=true \
+    +algorithm.m2_replay.selection.compute_runtime_zvp=false \
     +algorithm.m2_replay.selection.ingress_filter_mode=rlvr_non_degenerate \
     +algorithm.m2_replay.selection.zvp_mode=plain \
     +algorithm.m2_replay.schedule.floor_to_micro_multiple=true \
