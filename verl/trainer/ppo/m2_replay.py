@@ -374,6 +374,114 @@ def update_query_groups_zvp_stats(
     return processed
 
 
+def compute_zvp_stats_from_full_batch(
+    groups: list["QueryGroup"],
+    batch: "DataProto",
+    group_size: int,
+    zvp_mode: str,
+    lambda_neg: float,
+    adv_pos_eps: float = 1e-8,
+    update_step: Optional[int] = None,
+) -> None:
+    """Compute ZVP sufficient stats for all groups from full batch in one vectorized pass.
+
+    Eliminates 16x torch.stack re-stacking by using reshape on the already-contiguous
+    actor_view_batch tensors.
+
+    Mutates each group's ZVP fields in-place (same interface as update_query_groups_zvp_stats).
+    Groups must be in the same order as rows in batch (i.e., group i covers rows
+    [i*group_size : (i+1)*group_size]).
+    """
+    if not groups or group_size <= 0 or getattr(batch, "batch", None) is None:
+        return
+
+    old_log_probs = batch.batch["old_log_probs"]   # (n_total_rows, seq_len)
+    advantages = batch.batch["advantages"]           # (n_total_rows, seq_len)
+    response_mask = batch.batch["response_mask"]     # (n_total_rows, seq_len)
+
+    n_groups = len(groups)
+    expected_rows = n_groups * group_size
+    if int(old_log_probs.shape[0]) < expected_rows:
+        # fallback to per-group path
+        update_query_groups_zvp_stats(
+            groups, lambda_neg=lambda_neg, zvp_mode=zvp_mode, adv_pos_eps=adv_pos_eps, update_step=update_step
+        )
+        return
+
+    # Single reshape: (n_total_rows, seq_len) -> (n_groups, group_size, seq_len)
+    # This is a view when tensor is contiguous — no data copy
+    lp = old_log_probs[:expected_rows].reshape(n_groups, group_size, -1)
+    adv = advantages[:expected_rows].reshape(n_groups, group_size, -1)
+    mask = response_mask[:expected_rows].reshape(n_groups, group_size, -1)
+
+    normalized_mode = normalize_zvp_mode(zvp_mode)
+
+    # Single vectorized call replacing N per-group calls
+    score_num, score_denom, mean_surprisal_num, token_count, neg_count, pos_count = (
+        compute_group_zvp_sufficient_stats_batched(
+            log_probs=lp,
+            advantages=adv,
+            response_mask=mask,
+            adv_pos_eps=adv_pos_eps,
+            lambda_neg=lambda_neg,
+            zvp_mode=normalized_mode,
+        )
+    )  # each tensor has shape (n_groups,)
+
+    valid = token_count > 0
+    scores = torch.where(
+        score_denom > 0,
+        score_num / score_denom.clamp_min(1e-12),
+        torch.zeros_like(score_num),
+    )
+    mean_surprisal = torch.where(
+        valid,
+        mean_surprisal_num / token_count.clamp_min(1.0),
+        torch.zeros_like(mean_surprisal_num),
+    )
+    neg_frac = torch.where(valid, neg_count / token_count.clamp_min(1.0), torch.zeros_like(neg_count))
+    pos_frac = torch.where(valid, pos_count / token_count.clamp_min(1.0), torch.zeros_like(pos_count))
+
+    summary = torch.stack(
+        [
+            scores,
+            mean_surprisal,
+            neg_frac,
+            pos_frac,
+            score_num,
+            score_denom,
+            mean_surprisal_num,
+            token_count,
+            neg_count,
+            pos_count,
+        ],
+        dim=1,
+    ).detach()
+    summary_cpu = summary.cpu().tolist()
+
+    for idx, group in enumerate(groups):
+        (
+            group.zvp_score,
+            group.zvp_mean_surprisal,
+            group.zvp_neg_frac,
+            group.zvp_pos_frac,
+            group.zvp_score_num,
+            group.zvp_score_denom,
+            group.zvp_mean_surprisal_num,
+            group_token_count,
+            group_neg_count,
+            group_pos_count,
+        ) = summary_cpu[idx]
+        group.zvp_token_count = int(group_token_count)
+        group.zvp_neg_count = int(group_neg_count)
+        group.zvp_pos_count = int(group_pos_count)
+        if update_step is not None:
+            group.zvp_last_update_step = int(update_step)
+        elif int(getattr(group, "zvp_last_update_step", -1)) < 0:
+            group.zvp_last_update_step = int(getattr(group, "insertion_step", 0))
+        group.zvp_update_count = int(getattr(group, "zvp_update_count", 0)) + 1
+
+
 def compute_group_m2_batched(
     old_log_probs: torch.Tensor,
     new_log_probs: torch.Tensor,
