@@ -316,6 +316,74 @@ def test_fullbatch_zvp_matches_per_group_zvp():
         assert abs(ref - new) < 1e-5, f"Group {i}: ref={ref:.6f}, new={new:.6f}"
 
 
+def test_fullbatch_zvp_matches_per_group_zvp_adv_magnitude():
+    """Same as test_fullbatch_zvp_matches_per_group_zvp but for adv_magnitude mode."""
+    import torch
+    import numpy as np
+    from verl import DataProto
+    from verl.trainer.ppo.m2_replay import (
+        update_query_groups_zvp_stats,
+        compute_zvp_stats_from_full_batch,
+    )
+    from verl.trainer.ppo.m2_replay_adapter import build_query_groups_from_onpolicy_batch
+
+    torch.manual_seed(42)
+    n_groups = 8
+    group_size = 4
+    seq_len = 32
+    total_rows = n_groups * group_size
+
+    old_log_probs = torch.randn(total_rows, seq_len)
+    advantages = torch.randn(total_rows, seq_len)
+    response_mask = (torch.rand(total_rows, seq_len) > 0.3).bool()
+    uid_arr = np.repeat(np.arange(n_groups), group_size).astype(str)
+
+    batch = DataProto.from_dict(
+        tensors={
+            "old_log_probs": old_log_probs,
+            "advantages": advantages,
+            "response_mask": response_mask,
+            "responses": torch.zeros(total_rows, seq_len, dtype=torch.long),
+            "input_ids": torch.zeros(total_rows, seq_len, dtype=torch.long),
+            "attention_mask": response_mask.long(),
+            "position_ids": torch.zeros(total_rows, seq_len, dtype=torch.long),
+        },
+        non_tensors={"uid": uid_arr},
+    )
+
+    # Method 1: build groups then update ZVP per-group (existing path)
+    result = build_query_groups_from_onpolicy_batch(
+        batch=batch,
+        expected_group_size=group_size,
+        insertion_step=1,
+        compute_zvp_stats=False,
+    )
+    groups_ref = result.groups
+    update_query_groups_zvp_stats(groups_ref, lambda_neg=1.0, zvp_mode="adv_magnitude", update_step=1)
+    scores_ref = [g.zvp_score for g in groups_ref]
+
+    # Method 2: full-batch fast path
+    result2 = build_query_groups_from_onpolicy_batch(
+        batch=batch,
+        expected_group_size=group_size,
+        insertion_step=1,
+        compute_zvp_stats=False,
+    )
+    groups_new = result2.groups
+    compute_zvp_stats_from_full_batch(
+        groups=groups_new,
+        batch=batch,
+        group_size=group_size,
+        zvp_mode="adv_magnitude",
+        lambda_neg=1.0,
+        update_step=1,
+    )
+    scores_new = [g.zvp_score for g in groups_new]
+
+    for i, (ref, new) in enumerate(zip(scores_ref, scores_new)):
+        assert abs(ref - new) < 1e-5, f"Group {i}: ref={ref:.6f}, new={new:.6f}"
+
+
 def test_build_actor_batch_from_groups_one_shot_concat_matches_legacy():
     onpolicy_batch = _make_onpolicy_batch()
     group_result = build_query_groups_from_onpolicy_batch(

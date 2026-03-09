@@ -395,6 +395,11 @@ def compute_zvp_stats_from_full_batch(
     if not groups or group_size <= 0 or getattr(batch, "batch", None) is None:
         return
 
+    _REQUIRED_KEYS = {"old_log_probs", "advantages", "response_mask"}
+    if not _REQUIRED_KEYS.issubset(set(batch.batch.keys())):
+        update_query_groups_zvp_stats(groups, lambda_neg=lambda_neg, zvp_mode=zvp_mode, update_step=update_step)
+        return
+
     old_log_probs = batch.batch["old_log_probs"]   # (n_total_rows, seq_len)
     advantages = batch.batch["advantages"]           # (n_total_rows, seq_len)
     response_mask = batch.batch["response_mask"]     # (n_total_rows, seq_len)
@@ -402,12 +407,21 @@ def compute_zvp_stats_from_full_batch(
     n_groups = len(groups)
     expected_rows = n_groups * group_size
     if int(old_log_probs.shape[0]) < expected_rows:
-        # fallback to per-group path
+        print(
+            f"[m2_replay] WARNING: compute_zvp_stats_from_full_batch: batch too small "
+            f"({int(old_log_probs.shape[0])} rows, need {expected_rows}). "
+            f"Falling back to per-group ZVP computation.",
+            flush=True,
+        )
         update_query_groups_zvp_stats(
             groups, lambda_neg=lambda_neg, zvp_mode=zvp_mode, adv_pos_eps=adv_pos_eps, update_step=update_step
         )
         return
 
+    # INVARIANT: group i must cover rows [i*group_size : (i+1)*group_size] of `batch`.
+    # If groups have been reordered (e.g., sorted by ZVP score) relative to batch rows,
+    # stats will be silently mis-assigned. Only call this function immediately after
+    # build_query_groups_from_onpolicy_batch() with the same batch, before any reordering.
     # Single reshape: (n_total_rows, seq_len) -> (n_groups, group_size, seq_len)
     # This is a view when tensor is contiguous — no data copy
     lp = old_log_probs[:expected_rows].reshape(n_groups, group_size, -1)
