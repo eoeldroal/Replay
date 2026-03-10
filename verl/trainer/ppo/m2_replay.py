@@ -740,6 +740,7 @@ def select_replay_groups(
     rejected_eval_error = 0
     scanned_groups = 0
     _fastpath_logged: list[bool] = [False]  # mutable container to track one-time warning
+    required_fields = {"old_log_probs", "response_mask"}
 
     def _append_selected_group(
         group: QueryGroup,
@@ -806,6 +807,79 @@ def select_replay_groups(
         if timing_raw is not None:
             timing_raw["m2_select_m2_eval"] = timing_raw.get("m2_select_m2_eval", 0.0) + (time.perf_counter() - t0)
 
+    def _build_scan_entries(groups: list[QueryGroup]) -> tuple[list[Optional[int]], list[QueryGroup]]:
+        candidate_valid_indices: list[Optional[int]] = []
+        valid_groups: list[QueryGroup] = []
+        for group in groups:
+            if group.data.batch is None or not required_fields.issubset(set(group.data.batch.keys())):
+                candidate_valid_indices.append(None)
+                continue
+            candidate_valid_indices.append(len(valid_groups))
+            valid_groups.append(group)
+        return candidate_valid_indices, valid_groups
+
+    def _collect_selected_valid_indices(
+        candidate_valid_indices: list[Optional[int]],
+        m2_by_valid_index: list[float],
+    ) -> list[int]:
+        nonlocal scanned_groups, rejected_missing_fields, rejected_by_tau
+        selected_valid_indices: list[int] = []
+        for valid_idx in candidate_valid_indices:
+            if len(selected_valid_indices) >= target_groups:
+                break
+            scanned_groups += 1
+            if valid_idx is None:
+                rejected_missing_fields += 1
+                continue
+            if float(m2_by_valid_index[valid_idx]) <= float(tau):
+                selected_valid_indices.append(valid_idx)
+            else:
+                rejected_by_tau += 1
+        return selected_valid_indices
+
+    def _append_selected_valid_indices(
+        valid_groups: list[QueryGroup],
+        selected_valid_indices: list[int],
+        m2_by_valid_index: list[float],
+        runtime_stats_map: dict[int, tuple[float, float, float, float]],
+    ) -> None:
+        for valid_idx in selected_valid_indices:
+            _append_selected_group(
+                valid_groups[valid_idx],
+                m2=float(m2_by_valid_index[valid_idx]),
+                runtime_stats=runtime_stats_map.get(valid_idx, None),
+            )
+
+    def _run_per_group_fallback(
+        candidate_valid_indices: list[Optional[int]],
+        valid_groups: list[QueryGroup],
+        *,
+        precomputed_new_log_probs: Optional[list[torch.Tensor]] = None,
+    ) -> None:
+        nonlocal scanned_groups, rejected_missing_fields, rejected_eval_error
+        for valid_idx in candidate_valid_indices:
+            if len(selected) >= target_groups:
+                break
+            scanned_groups += 1
+            if valid_idx is None:
+                rejected_missing_fields += 1
+                continue
+            group = valid_groups[valid_idx]
+            try:
+                if precomputed_new_log_probs is None:
+                    t0 = time.perf_counter()
+                    new_log_probs = compute_new_log_probs_fn(group.data)
+                    if timing_raw is not None:
+                        timing_raw["m2_select_logprob_eval"] = timing_raw.get("m2_select_logprob_eval", 0.0) + (
+                            time.perf_counter() - t0
+                        )
+                else:
+                    new_log_probs = precomputed_new_log_probs[valid_idx]
+                _accept_if_passing_tau(group, new_log_probs)
+            except Exception:
+                rejected_eval_error += 1
+                continue
+
     scan_candidates = candidates[:scan_limit]
     use_chunked_logprob = (
         compute_new_log_probs_batch_fn is not None
@@ -820,8 +894,7 @@ def select_replay_groups(
                 break
             scanned_groups += 1
 
-            required = {"old_log_probs", "response_mask"}
-            if group.data.batch is None or not required.issubset(set(group.data.batch.keys())):
+            if group.data.batch is None or not required_fields.issubset(set(group.data.batch.keys())):
                 rejected_missing_fields += 1
                 continue
 
@@ -837,65 +910,54 @@ def select_replay_groups(
                 rejected_eval_error += 1
                 continue
     else:
-        chunk_size = max(int(groups_per_chunk), 1)
-        for chunk_start in range(0, len(scan_candidates), chunk_size):
-            if len(selected) >= target_groups:
-                break
-            chunk = scan_candidates[chunk_start : chunk_start + chunk_size]
+        candidate_valid_indices, valid_groups = _build_scan_entries(scan_candidates)
 
-            valid_groups: list[QueryGroup] = []
-            for group in chunk:
-                scanned_groups += 1
-                required = {"old_log_probs", "response_mask"}
-                if group.data.batch is None or not required.issubset(set(group.data.batch.keys())):
-                    rejected_missing_fields += 1
-                    continue
-                valid_groups.append(group)
+        if not valid_groups:
+            _collect_selected_valid_indices(candidate_valid_indices, [])
+        elif use_gpu_m2_fastpath:
+            try:
+                t0 = time.perf_counter()
+                m2_cpu = [float(m2) for m2 in compute_group_m2_batch_fn([group.data for group in valid_groups])]
+                if timing_raw is not None:
+                    timing_raw["m2_select_logprob_eval"] = timing_raw.get("m2_select_logprob_eval", 0.0) + (
+                        time.perf_counter() - t0
+                    )
+                if len(m2_cpu) != len(valid_groups):
+                    raise ValueError(
+                        "compute_group_m2_batch_fn must return one scalar per group, "
+                        f"got {len(m2_cpu)} for {len(valid_groups)} groups."
+                    )
+            except Exception as _fastpath_exc:
+                if not _fastpath_logged[0]:
+                    import traceback as _tb
+                    print(
+                        f"[m2_replay] WARNING: GPU M2 fastpath failed, falling back to CPU path. "
+                        f"Exception: {type(_fastpath_exc).__name__}: {_fastpath_exc}\n"
+                        f"{_tb.format_exc()}",
+                        flush=True,
+                    )
+                    _fastpath_logged[0] = True
+            else:
+                selected_valid_indices = _collect_selected_valid_indices(candidate_valid_indices, m2_cpu)
+                _append_selected_valid_indices(valid_groups, selected_valid_indices, m2_cpu, runtime_stats_map={})
+                if timing_raw is not None:
+                    timing_raw["m2_select_scan_loop"] = timing_raw.get("m2_select_scan_loop", 0.0) + (
+                        time.perf_counter() - loop_start
+                    )
+                return ReplaySelectionResult(
+                    selected_groups=selected,
+                    scanned_groups=scanned_groups,
+                    target_groups=target_groups,
+                    rejected_missing_fields=rejected_missing_fields,
+                    rejected_by_tau=rejected_by_tau,
+                    rejected_eval_error=rejected_eval_error,
+                    accepted_m2=accepted_m2,
+                    selected_priority_debug=selected_priority_debug,
+                    candidate_priority_preview=candidate_priority_preview,
+                    candidate_priority_all=candidate_priority_all,
+                )
 
-            if not valid_groups:
-                continue
-
-            if use_gpu_m2_fastpath:
-                try:
-                    t0 = time.perf_counter()
-                    m2_cpu = [float(m2) for m2 in compute_group_m2_batch_fn([group.data for group in valid_groups])]
-                    if timing_raw is not None:
-                        timing_raw["m2_select_logprob_eval"] = timing_raw.get("m2_select_logprob_eval", 0.0) + (
-                            time.perf_counter() - t0
-                        )
-                    if len(m2_cpu) != len(valid_groups):
-                        raise ValueError(
-                            "compute_group_m2_batch_fn must return one scalar per group, "
-                            f"got {len(m2_cpu)} for {len(valid_groups)} groups."
-                        )
-                except Exception as _fastpath_exc:
-                    if not _fastpath_logged[0]:
-                        import traceback as _tb
-                        print(
-                            f"[m2_replay] WARNING: GPU M2 fastpath failed, falling back to CPU path. "
-                            f"Exception: {type(_fastpath_exc).__name__}: {_fastpath_exc}\n"
-                            f"{_tb.format_exc()}",
-                            flush=True,
-                        )
-                        _fastpath_logged[0] = True
-                    m2_cpu = []
-                else:
-                    remaining_slots = max(int(target_groups) - len(selected), 0)
-                    accepted_indices: list[int] = []
-                    for idx, m2 in enumerate(m2_cpu):
-                        if len(accepted_indices) >= remaining_slots:
-                            break
-                        if float(m2) <= float(tau):
-                            accepted_indices.append(idx)
-                        else:
-                            rejected_by_tau += 1
-
-                    for idx in accepted_indices:
-                        if len(selected) >= target_groups:
-                            break
-                        _append_selected_group(valid_groups[idx], m2=float(m2_cpu[idx]), runtime_stats=None)
-                    continue
-
+        if valid_groups:
             try:
                 t0 = time.perf_counter()
                 new_log_probs_list = compute_new_log_probs_batch_fn([group.data for group in valid_groups])
@@ -909,84 +971,54 @@ def select_replay_groups(
                         f"got {len(new_log_probs_list)} for {len(valid_groups)} groups."
                     )
             except Exception:
-                # Fallback to per-group evaluation to preserve correctness.
-                for group in valid_groups:
-                    if len(selected) >= target_groups:
-                        break
-                    try:
-                        t0 = time.perf_counter()
-                        new_log_probs = compute_new_log_probs_fn(group.data)
-                        if timing_raw is not None:
-                            timing_raw["m2_select_logprob_eval"] = timing_raw.get("m2_select_logprob_eval", 0.0) + (
-                                time.perf_counter() - t0
-                            )
-                        _accept_if_passing_tau(group, new_log_probs)
-                    except Exception:
-                        rejected_eval_error += 1
-                continue
-
-            try:
-                t0 = time.perf_counter()
-                old_log_probs = torch.stack([group.data.batch["old_log_probs"] for group in valid_groups], dim=0)
-                response_mask = torch.stack([group.data.batch["response_mask"] for group in valid_groups], dim=0)
-                new_log_probs = torch.stack(new_log_probs_list, dim=0)
-                m2_values = compute_group_m2_batched(
-                    old_log_probs=old_log_probs,
-                    new_log_probs=new_log_probs,
-                    response_mask=response_mask,
-                )
-                if timing_raw is not None:
-                    timing_raw["m2_select_m2_eval"] = timing_raw.get("m2_select_m2_eval", 0.0) + (
-                        time.perf_counter() - t0
+                _run_per_group_fallback(candidate_valid_indices, valid_groups)
+            else:
+                try:
+                    t0 = time.perf_counter()
+                    old_log_probs = torch.stack([group.data.batch["old_log_probs"] for group in valid_groups], dim=0)
+                    response_mask = torch.stack([group.data.batch["response_mask"] for group in valid_groups], dim=0)
+                    new_log_probs = torch.stack(new_log_probs_list, dim=0)
+                    m2_values = compute_group_m2_batched(
+                        old_log_probs=old_log_probs,
+                        new_log_probs=new_log_probs,
+                        response_mask=response_mask,
                     )
-            except Exception:
-                for group, new_log_probs_single in zip(valid_groups, new_log_probs_list, strict=True):
-                    if len(selected) >= target_groups:
-                        break
-                    try:
-                        _accept_if_passing_tau(group, new_log_probs_single)
-                    except Exception:
-                        rejected_eval_error += 1
-                continue
-
-            remaining_slots = max(int(target_groups) - len(selected), 0)
-            accepted_indices: list[int] = []
-            m2_cpu = m2_values.detach().cpu().tolist()
-            for idx, m2 in enumerate(m2_cpu):
-                if len(accepted_indices) >= remaining_slots:
-                    break
-                if float(m2) <= float(tau):
-                    accepted_indices.append(idx)
+                    if timing_raw is not None:
+                        timing_raw["m2_select_m2_eval"] = timing_raw.get("m2_select_m2_eval", 0.0) + (
+                            time.perf_counter() - t0
+                        )
+                    m2_cpu = [float(value) for value in m2_values.detach().cpu().tolist()]
+                except Exception:
+                    _run_per_group_fallback(
+                        candidate_valid_indices,
+                        valid_groups,
+                        precomputed_new_log_probs=new_log_probs_list,
+                    )
                 else:
-                    rejected_by_tau += 1
-
-            runtime_stats_map: dict[int, tuple[float, float, float, float]] = {}
-            if compute_runtime_zvp and accepted_indices:
-                accepted_groups = [valid_groups[idx] for idx in accepted_indices]
-                accepted_new_log_probs = [new_log_probs_list[idx] for idx in accepted_indices]
-                runtime_stats = compute_group_runtime_zvp_stats_batched(
-                    accepted_groups,
-                    accepted_new_log_probs,
-                    adv_pos_eps=adv_pos_eps,
-                    lambda_neg=zvp_lambda_neg,
-                    zvp_mode=normalized_zvp_mode,
-                )
-                runtime_stats_map = {
-                    accepted_idx: runtime_stat
-                    for accepted_idx, runtime_stat in zip(accepted_indices, runtime_stats, strict=True)
-                }
-
-            for idx, (group, _) in enumerate(zip(valid_groups, new_log_probs_list, strict=True)):
-                if len(selected) >= target_groups:
-                    break
-                runtime_stats = runtime_stats_map.get(idx, None)
-                if compute_runtime_zvp and runtime_stats is None:
-                    continue
-                _append_selected_group(
-                    group,
-                    m2=float(m2_cpu[idx]),
-                    runtime_stats=runtime_stats,
-                )
+                    selected_valid_indices = _collect_selected_valid_indices(candidate_valid_indices, m2_cpu)
+                    runtime_stats_map: dict[int, tuple[float, float, float, float]] = {}
+                    if compute_runtime_zvp and selected_valid_indices:
+                        accepted_groups = [valid_groups[idx] for idx in selected_valid_indices]
+                        accepted_new_log_probs = [new_log_probs_list[idx] for idx in selected_valid_indices]
+                        runtime_stats = compute_group_runtime_zvp_stats_batched(
+                            accepted_groups,
+                            accepted_new_log_probs,
+                            adv_pos_eps=adv_pos_eps,
+                            lambda_neg=zvp_lambda_neg,
+                            zvp_mode=normalized_zvp_mode,
+                        )
+                        runtime_stats_map = {
+                            selected_idx: runtime_stat
+                            for selected_idx, runtime_stat in zip(selected_valid_indices, runtime_stats, strict=True)
+                        }
+                    _append_selected_valid_indices(
+                        valid_groups,
+                        selected_valid_indices,
+                        m2_cpu,
+                        runtime_stats_map=runtime_stats_map,
+                    )
+        else:
+            _collect_selected_valid_indices(candidate_valid_indices, [])
     if timing_raw is not None:
         timing_raw["m2_select_scan_loop"] = timing_raw.get("m2_select_scan_loop", 0.0) + (
             time.perf_counter() - loop_start

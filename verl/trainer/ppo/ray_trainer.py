@@ -54,6 +54,7 @@ from verl.trainer.ppo.metric_utils import (
 from verl.trainer.ppo.m2_replay import (
     QueryGroupReplayBuffer,
     ReplaySelectionResult,
+    compute_zvp_stats_from_full_batch,
     derive_micro_group_multiple,
     normalize_zvp_mode,
     select_replay_groups,
@@ -63,6 +64,7 @@ from verl.trainer.ppo.m2_replay_adapter import (
     build_actor_batch_from_groups,
     build_actor_batch_with_replay,
     build_query_groups_from_onpolicy_batch,
+    concat_query_groups,
     compute_actor_batch_metrics,
     derive_ingress_success_band,
     filter_query_groups_for_ingress,
@@ -1929,13 +1931,19 @@ class RayPPOTrainer:
                 )
                 if should_init_onpolicy_zvp and onpolicy_ingress_groups:
                     _t0 = time.perf_counter()
-                    update_query_groups_zvp_stats(
-                        onpolicy_ingress_groups,
-                        lambda_neg=self.m2_replay_zvp_lambda_neg,
-                        zvp_mode=self.m2_replay_zvp_mode,
-                        update_step=int(self.global_steps),
+                    ingress_batch = concat_query_groups(onpolicy_ingress_groups)
+                    if ingress_batch is not None:
+                        compute_zvp_stats_from_full_batch(
+                            groups=onpolicy_ingress_groups,
+                            batch=ingress_batch,
+                            group_size=rollout_n,
+                            zvp_mode=self.m2_replay_zvp_mode,
+                            lambda_neg=self.m2_replay_zvp_lambda_neg,
+                            update_step=int(self.global_steps),
+                        )
+                    m2_timing_raw["m2_prepare_zvp_init"] = m2_timing_raw.get("m2_prepare_zvp_init", 0.0) + (
+                        time.perf_counter() - _t0
                     )
-                    m2_timing_raw["m2_prepare_zvp_init"] = m2_timing_raw.get("m2_prepare_zvp_init", 0.0) + (time.perf_counter() - _t0)
             else:
                 _t0 = time.perf_counter()
                 group_build_result = build_query_groups_from_onpolicy_batch(
@@ -1946,21 +1954,12 @@ class RayPPOTrainer:
                     success_count_max=ingress_success_count_max,
                     zvp_lambda_neg=self.m2_replay_zvp_lambda_neg,
                     zvp_mode=self.m2_replay_zvp_mode,
-                    compute_zvp_stats=False,
+                    compute_zvp_stats=should_init_onpolicy_zvp,
                 )
                 m2_timing_raw["m2_prepare_group_build"] = m2_timing_raw.get("m2_prepare_group_build", 0.0) + (time.perf_counter() - _t0)
                 onpolicy_ingress_groups = group_build_result.groups
                 skipped_by_success_band = group_build_result.skipped_by_success_band
                 onpolicy_all_groups = onpolicy_ingress_groups
-                if should_init_onpolicy_zvp and onpolicy_ingress_groups:
-                    _t0 = time.perf_counter()
-                    update_query_groups_zvp_stats(
-                        onpolicy_ingress_groups,
-                        lambda_neg=self.m2_replay_zvp_lambda_neg,
-                        zvp_mode=self.m2_replay_zvp_mode,
-                        update_step=int(self.global_steps),
-                    )
-                    m2_timing_raw["m2_prepare_zvp_init"] = m2_timing_raw.get("m2_prepare_zvp_init", 0.0) + (time.perf_counter() - _t0)
 
         metrics[self._m2_key("buffer/new_groups")] = float(len(onpolicy_ingress_groups))
         metrics[self._m2_key("buffer/skipped_incomplete")] = float(group_build_result.skipped_incomplete)
