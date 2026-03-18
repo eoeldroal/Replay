@@ -54,17 +54,17 @@ class ReplaySelectionResult:
     selected_priority_debug: list[dict[str, object]] = field(default_factory=list)
     candidate_priority_preview: list[dict[str, object]] = field(default_factory=list)
     candidate_priority_all: list[dict[str, object]] = field(default_factory=list)
+    rejected_by_tau_zvp_updates: list[tuple["QueryGroup", tuple[float, float, float, float]]] = field(
+        default_factory=list
+    )
 
     def to_metrics(self, prefix: str) -> dict[str, float]:
         accepted = len(self.selected_groups)
         avg_m2 = float(sum(self.accepted_m2) / len(self.accepted_m2)) if self.accepted_m2 else 0.0
         return {
-            f"{prefix}/pass1/target_groups": float(self.target_groups),
             f"{prefix}/pass1/scanned_groups": float(self.scanned_groups),
             f"{prefix}/pass1/accepted_groups": float(accepted),
-            f"{prefix}/pass1/rejected_missing_fields": float(self.rejected_missing_fields),
             f"{prefix}/pass1/rejected_by_tau": float(self.rejected_by_tau),
-            f"{prefix}/pass1/rejected_eval_error": float(self.rejected_eval_error),
             f"{prefix}/pass1/acceptance_rate": float(accepted / max(self.scanned_groups, 1)),
             f"{prefix}/pass1/accepted_m2_mean": avg_m2,
         }
@@ -739,6 +739,7 @@ def select_replay_groups(
     rejected_by_tau = 0
     rejected_eval_error = 0
     scanned_groups = 0
+    rejected_zvp_updates: list[tuple[QueryGroup, tuple[float, float, float, float]]] = []
     _fastpath_logged: list[bool] = [False]  # mutable container to track one-time warning
     required_fields = {"old_log_probs", "response_mask"}
 
@@ -804,6 +805,15 @@ def select_replay_groups(
             _append_selected_group(group, m2=float(m2), runtime_stats=runtime_stats)
         else:
             rejected_by_tau += 1
+            if compute_runtime_zvp and "advantages" in group.data.batch.keys():
+                rej_zvp = compute_group_runtime_zvp_stats_batched(
+                    [group],
+                    [new_log_probs],
+                    adv_pos_eps=adv_pos_eps,
+                    lambda_neg=zvp_lambda_neg,
+                    zvp_mode=normalized_zvp_mode,
+                )[0]
+                rejected_zvp_updates.append((group, rej_zvp))
         if timing_raw is not None:
             timing_raw["m2_select_m2_eval"] = timing_raw.get("m2_select_m2_eval", 0.0) + (time.perf_counter() - t0)
 
@@ -1011,6 +1021,27 @@ def select_replay_groups(
                             selected_idx: runtime_stat
                             for selected_idx, runtime_stat in zip(selected_valid_indices, runtime_stats, strict=True)
                         }
+                    if compute_runtime_zvp:
+                        selected_set = set(selected_valid_indices)
+                        rej_indices = [
+                            i
+                            for i, m2_val in enumerate(m2_cpu)
+                            if m2_val > tau
+                            and i not in selected_set
+                            and "advantages" in valid_groups[i].data.batch.keys()
+                        ]
+                        if rej_indices:
+                            rej_groups = [valid_groups[i] for i in rej_indices]
+                            rej_lp = [new_log_probs_list[i] for i in rej_indices]
+                            rej_stats = compute_group_runtime_zvp_stats_batched(
+                                rej_groups,
+                                rej_lp,
+                                adv_pos_eps=adv_pos_eps,
+                                lambda_neg=zvp_lambda_neg,
+                                zvp_mode=normalized_zvp_mode,
+                            )
+                            for grp, st in zip(rej_groups, rej_stats, strict=True):
+                                rejected_zvp_updates.append((grp, st))
                     _append_selected_valid_indices(
                         valid_groups,
                         selected_valid_indices,
@@ -1035,6 +1066,7 @@ def select_replay_groups(
         selected_priority_debug=selected_priority_debug,
         candidate_priority_preview=candidate_priority_preview,
         candidate_priority_all=candidate_priority_all,
+        rejected_by_tau_zvp_updates=rejected_zvp_updates,
     )
 
 

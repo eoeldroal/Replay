@@ -86,12 +86,12 @@ def test_filter_query_groups_for_ingress_supports_non_degenerate_mode():
         for i in range(5)
     ]
 
-    halfband_groups, halfband_skipped = filter_query_groups_for_ingress(
+    halfband_groups, halfband_skipped, halfband_tool_skipped = filter_query_groups_for_ingress(
         groups=groups,
         rollout_n=4,
         ingress_filter_mode="rlvr_halfband",
     )
-    non_degenerate_groups, non_degenerate_skipped = filter_query_groups_for_ingress(
+    non_degenerate_groups, non_degenerate_skipped, non_degenerate_tool_skipped = filter_query_groups_for_ingress(
         groups=groups,
         rollout_n=4,
         ingress_filter_mode="rlvr_non_degenerate",
@@ -99,8 +99,10 @@ def test_filter_query_groups_for_ingress_supports_non_degenerate_mode():
 
     assert [group.success_count for group in halfband_groups] == [1, 2]
     assert halfband_skipped == 3
+    assert halfband_tool_skipped == 0
     assert [group.success_count for group in non_degenerate_groups] == [1, 2, 3]
     assert non_degenerate_skipped == 2
+    assert non_degenerate_tool_skipped == 0
 
 
 def test_build_query_groups_from_onpolicy_batch_supports_adv_magnitude_zvp():

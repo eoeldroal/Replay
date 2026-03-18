@@ -1110,9 +1110,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         returns only per-group M2 scalars to the driver.
         """
         assert self._is_actor
-        if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
-
         from contextlib import nullcontext
 
         is_lora = data.meta_info.pop("is_lora", False)
@@ -1126,7 +1123,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if any(length <= 0 for length in group_lengths):
             raise ValueError(f"m2_group_lengths must all be > 0, got {group_lengths}.")
 
-        adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
         config_source = self.config.ref if is_lora else self.config.rollout
         micro_batch_size, max_token_len, use_dynamic_bsz = _resolve_log_prob_batching_settings(
             data.meta_info,
@@ -1146,6 +1142,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 "compute_log_prob_m2 group length mismatch: "
                 f"sum(group_lengths)={sum(group_lengths)} vs batch_rows={batch_rows}."
             )
+
+        if batch_rows == 0:
+            return DataProto.from_dict(
+                tensors={"m2": torch.empty(0, dtype=torch.float32)},
+                meta_info={"temperature": self.config.rollout.temperature},
+            )
+
+        adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
         with self.ulysses_sharding_manager:
             with adapter_ctx:

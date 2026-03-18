@@ -210,6 +210,35 @@ def list_of_dict_to_dict_of_list(list_of_dict: list[dict]):
     return output
 
 
+def _split_group_lengths_for_chunking(group_lengths: list[int], chunks: int) -> list[list[int]]:
+    if chunks <= 0:
+        raise ValueError(f"chunks must be > 0, got {chunks}.")
+
+    if len(group_lengths) == 0:
+        return [[] for _ in range(chunks)]
+
+    group_indices = np.array_split(np.arange(len(group_lengths), dtype=np.int64), chunks)
+    output: list[list[int]] = []
+    for indices in group_indices:
+        if len(indices) == 0:
+            output.append([])
+            continue
+        start = int(indices[0])
+        end = int(indices[-1]) + 1
+        output.append(group_lengths[start:end])
+    return output
+
+
+def _chunk_ranges_from_group_lengths(group_lengths_chunks: list[list[int]]) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    row_cursor = 0
+    for chunk_group_lengths in group_lengths_chunks:
+        chunk_rows = int(sum(chunk_group_lengths))
+        ranges.append((row_cursor, row_cursor + chunk_rows))
+        row_cursor += chunk_rows
+    return ranges
+
+
 def fold_batch_dim(data: "DataProto", new_batch_size):
     """
     Fold a batch dim from [bsz, xxx] into [new_bsz, bsz // new_bsz, xxx]
@@ -881,6 +910,27 @@ class DataProto:
         Returns:
             List[DataProto]: a list of DataProto after splitting
         """
+        group_lengths = self.meta_info.get("m2_group_lengths")
+        if group_lengths is not None:
+            group_lengths = [int(length) for length in group_lengths]
+            assert all(length > 0 for length in group_lengths), (
+                "meta_info['m2_group_lengths'] must contain only positive lengths. "
+                f"Got {group_lengths}."
+            )
+            assert sum(group_lengths) == len(self), (
+                "meta_info['m2_group_lengths'] must sum to the DataProto batch size. "
+                f"Got sum(group_lengths)={sum(group_lengths)} and len(self)={len(self)}."
+            )
+            group_length_chunks = _split_group_lengths_for_chunking(group_lengths, chunks)
+            chunk_ranges = _chunk_ranges_from_group_lengths(group_length_chunks)
+            output = []
+            for (start, end), chunk_group_lengths in zip(chunk_ranges, group_length_chunks, strict=True):
+                chunk = self[start:end]
+                chunk.meta_info = dict(self.meta_info)
+                chunk.meta_info["m2_group_lengths"] = chunk_group_lengths
+                output.append(chunk)
+            return output
+
         if not self.is_padding_enabled():
             assert len(self) % chunks == 0, (
                 f"only support equal chunk. Got size of DataProto {len(self)} and chunk {chunks}."
@@ -908,7 +958,7 @@ class DataProto:
         output = []
         for i in range(chunks):
             output.append(
-                type(self)(batch=batch_lst[i], non_tensor_batch=non_tensor_batch_lst[i], meta_info=self.meta_info)
+                type(self)(batch=batch_lst[i], non_tensor_batch=non_tensor_batch_lst[i], meta_info=dict(self.meta_info))
             )
 
         return output
@@ -949,6 +999,7 @@ class DataProto:
         if data:
             # Merge non-metric meta_info and aggregate metrics from all workers.
             all_metrics = []
+            merged_group_lengths: Optional[list[int]] = None
             for d in data:
                 for k, v in d.meta_info.items():
                     if k == "metrics":
@@ -957,6 +1008,10 @@ class DataProto:
                                 all_metrics.extend(v)
                             else:
                                 all_metrics.append(v)
+                    elif k == "m2_group_lengths":
+                        if merged_group_lengths is None:
+                            merged_group_lengths = []
+                        merged_group_lengths.extend(int(length) for length in v)
                     else:
                         if k in merged_meta_info:
                             # Ensure consistency for overlapping non-metric keys
@@ -967,6 +1022,8 @@ class DataProto:
             # Flatten list of dicts to dict of lists for consistent metrics structure
             if all_metrics:
                 merged_meta_info["metrics"] = list_of_dict_to_dict_of_list(all_metrics)
+            if merged_group_lengths is not None:
+                merged_meta_info["m2_group_lengths"] = merged_group_lengths
 
         cls = type(data[0]) if len(data) > 0 else DataProto
         return cls(batch=new_batch, non_tensor_batch=non_tensor_batch, meta_info=merged_meta_info)

@@ -44,6 +44,7 @@ class GroupBuildResult:
     skipped_incomplete: int
     skipped_missing_train_keys: int
     skipped_by_success_band: int
+    skipped_by_tool_pair_fraction: int
     group_debug_all: list[dict[str, object]]
 
     def to_metrics(self, prefix: str) -> dict[str, float]:
@@ -52,6 +53,7 @@ class GroupBuildResult:
             f"{prefix}/buffer/skipped_incomplete": float(self.skipped_incomplete),
             f"{prefix}/buffer/skipped_missing_train_keys": float(self.skipped_missing_train_keys),
             f"{prefix}/buffer/skipped_by_success_band": float(self.skipped_by_success_band),
+            f"{prefix}/buffer/skipped_by_tool_pair_fraction": float(self.skipped_by_tool_pair_fraction),
         }
 
 
@@ -226,19 +228,31 @@ def _masked_sample_score(group: DataProto) -> Optional[torch.Tensor]:
     return (score.float() * mask).sum(dim=-1)
 
 
-def _compute_group_success_stats(group: DataProto) -> tuple[float, int, int]:
+def _score_to_success(sample_score: torch.Tensor, success_score_threshold: Optional[float] = None) -> torch.Tensor:
+    if success_score_threshold is None:
+        return (sample_score > 0).float()
+    return (sample_score >= float(success_score_threshold)).float()
+
+
+def _compute_group_success_stats(
+    group: DataProto,
+    success_score_threshold: Optional[float] = None,
+) -> tuple[float, int, int]:
     sample_score = _masked_sample_score(group)
     if sample_score is None or sample_score.numel() == 0:
         return (0.5, 0, 0)
     # RLVR binary success proxy.
-    success = (sample_score > 0).float()
+    success = _score_to_success(sample_score, success_score_threshold=success_score_threshold)
     success_count = int(success.sum().item())
     group_size = int(success.numel())
     success_prob = float(success.mean().item())
     return (success_prob, success_count, group_size)
 
-
-def _compute_group_success_stats_from_batch(batch: DataProto, idxs: list[int]) -> tuple[float, int, int]:
+def _compute_group_success_stats_from_batch(
+    batch: DataProto,
+    idxs: list[int],
+    success_score_threshold: Optional[float] = None,
+) -> tuple[float, int, int]:
     if batch.batch is None:
         return (0.5, 0, 0)
 
@@ -256,7 +270,7 @@ def _compute_group_success_stats_from_batch(batch: DataProto, idxs: list[int]) -
     if sample_score.numel() == 0:
         return (0.5, 0, 0)
 
-    success = (sample_score > 0).float()
+    success = _score_to_success(sample_score, success_score_threshold=success_score_threshold)
     success_count = int(success.sum().item())
     group_size = int(success.numel())
     success_prob = float(success.mean().item())
@@ -269,7 +283,11 @@ def select_actor_training_view(data: DataProto) -> DataProto:
 
     batch_keys = [k for k in ACTOR_BATCH_KEYS if k in data.batch.keys()]
     batch_keys.extend([k for k in OPTIONAL_ACTOR_BATCH_KEYS if k in data.batch.keys()])
-    non_tensor_keys = [k for k in ["uid", "multi_modal_inputs"] if k in data.non_tensor_batch.keys()]
+    non_tensor_keys = [
+        k
+        for k in ["uid", "multi_modal_inputs", "tool_call_counts", "tool_response_pair_counts"]
+        if k in data.non_tensor_batch.keys()
+    ]
 
     view = data.select(batch_keys=batch_keys, non_tensor_batch_keys=non_tensor_keys)
     view.meta_info = {}
@@ -347,10 +365,17 @@ def filter_query_groups_for_ingress(
     groups: list[QueryGroup],
     rollout_n: int,
     ingress_filter_mode: str,
-) -> tuple[list[QueryGroup], int]:
+    tool_response_pair_fraction_min: Optional[float] = None,
+) -> tuple[list[QueryGroup], int, int]:
     normalized_mode = normalize_ingress_filter_mode(ingress_filter_mode)
-    if normalized_mode == "none":
-        return list(groups), 0
+    tool_pair_threshold = None
+    if tool_response_pair_fraction_min is not None:
+        tool_pair_threshold = max(float(tool_response_pair_fraction_min), 0.0)
+        if tool_pair_threshold <= 0:
+            tool_pair_threshold = None
+
+    if normalized_mode == "none" and tool_pair_threshold is None:
+        return list(groups), 0, 0
 
     max_success_count = 0
     if normalized_mode == "rlvr_halfband":
@@ -359,13 +384,30 @@ def filter_query_groups_for_ingress(
         max_success_count = int(rollout_n) - 1
 
     if max_success_count < 1:
-        return [], len(groups)
+        return [], len(groups), 0
 
-    filtered_groups = [
-        group for group in groups if 1 <= int(group.success_count) <= max_success_count
-    ]
-    skipped_groups = len(groups) - len(filtered_groups)
-    return filtered_groups, skipped_groups
+    filtered_groups = []
+    skipped_groups = 0
+    skipped_by_tool_pair_fraction = 0
+    for group in groups:
+        if normalized_mode != "none" and not (1 <= int(group.success_count) <= max_success_count):
+            skipped_groups += 1
+            continue
+        if tool_pair_threshold is not None:
+            pair_counts = group.data.non_tensor_batch.get("tool_response_pair_counts", None)
+            if pair_counts is None:
+                skipped_by_tool_pair_fraction += 1
+                continue
+            pair_counts = np.asarray(pair_counts)
+            if pair_counts.size == 0:
+                skipped_by_tool_pair_fraction += 1
+                continue
+            pair_fraction = float(np.mean(pair_counts.astype(np.float32) >= 1.0))
+            if pair_fraction < tool_pair_threshold:
+                skipped_by_tool_pair_fraction += 1
+                continue
+        filtered_groups.append(group)
+    return filtered_groups, skipped_groups, skipped_by_tool_pair_fraction
 
 
 def build_query_groups_from_onpolicy_batch(
@@ -374,6 +416,8 @@ def build_query_groups_from_onpolicy_batch(
     insertion_step: int,
     success_count_min: Optional[int] = None,
     success_count_max: Optional[int] = None,
+    success_score_threshold: Optional[float] = None,
+    tool_response_pair_fraction_min: Optional[float] = None,
     zvp_lambda_neg: float = 1.0,
     zvp_mode: str = "sign_only",
     compute_zvp_stats: bool = True,
@@ -385,6 +429,7 @@ def build_query_groups_from_onpolicy_batch(
             skipped_incomplete=0,
             skipped_missing_train_keys=0,
             skipped_by_success_band=0,
+            skipped_by_tool_pair_fraction=0,
             group_debug_all=[],
         )
 
@@ -394,9 +439,15 @@ def build_query_groups_from_onpolicy_batch(
     skipped_incomplete = 0
     skipped_missing_train_keys = 0
     skipped_by_success_band = 0
+    skipped_by_tool_pair_fraction = 0
     group_debug_all: list[dict[str, object]] = []
     normalized_zvp_mode = normalize_zvp_mode(zvp_mode)
     accepted_candidates: list[tuple[str, list[int], float, int, int, dict[str, object]]] = []
+    tool_pair_threshold = None
+    if tool_response_pair_fraction_min is not None:
+        tool_pair_threshold = max(float(tool_response_pair_fraction_min), 0.0)
+        if tool_pair_threshold <= 0:
+            tool_pair_threshold = None
 
     for uid, idxs in uid_groups:
         debug_entry: dict[str, object] = {
@@ -409,7 +460,11 @@ def build_query_groups_from_onpolicy_batch(
             group_debug_all.append(debug_entry)
             continue
 
-        success_prob, success_count, group_size = _compute_group_success_stats_from_batch(batch=batch, idxs=idxs)
+        success_prob, success_count, group_size = _compute_group_success_stats_from_batch(
+            batch=batch,
+            idxs=idxs,
+            success_score_threshold=success_score_threshold,
+        )
         debug_entry["success_prob"] = float(success_prob)
         debug_entry["success_count"] = int(success_count)
         debug_entry["group_size"] = int(group_size)
@@ -423,6 +478,21 @@ def build_query_groups_from_onpolicy_batch(
             debug_entry["status"] = "skipped_by_success_band"
             group_debug_all.append(debug_entry)
             continue
+        if tool_pair_threshold is not None:
+            pair_counts = batch.non_tensor_batch.get("tool_response_pair_counts", None)
+            if pair_counts is None:
+                skipped_by_tool_pair_fraction += 1
+                debug_entry["status"] = "skipped_by_tool_pair_fraction"
+                group_debug_all.append(debug_entry)
+                continue
+            pair_counts = np.asarray(pair_counts)[idxs]
+            pair_fraction = float(np.mean(pair_counts.astype(np.float32) >= 1.0)) if len(pair_counts) > 0 else 0.0
+            debug_entry["tool_response_pair_fraction"] = pair_fraction
+            if pair_fraction < tool_pair_threshold:
+                skipped_by_tool_pair_fraction += 1
+                debug_entry["status"] = "skipped_by_tool_pair_fraction"
+                group_debug_all.append(debug_entry)
+                continue
         accepted_candidates.append((str(uid), idxs, success_prob, success_count, group_size, debug_entry))
 
     required_keys = {"old_log_probs", "advantages", "response_mask"}
@@ -481,6 +551,7 @@ def build_query_groups_from_onpolicy_batch(
         skipped_incomplete=skipped_incomplete,
         skipped_missing_train_keys=skipped_missing_train_keys,
         skipped_by_success_band=skipped_by_success_band,
+        skipped_by_tool_pair_fraction=skipped_by_tool_pair_fraction,
         group_debug_all=group_debug_all,
     )
 

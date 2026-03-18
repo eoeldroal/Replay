@@ -162,6 +162,48 @@ class M2ReplayStartGateState:
     selection_ready: bool
 
 
+@dataclass(frozen=True)
+class M2ReplayEntropyLingeringState:
+    entropy_initial: Optional[float] = None
+    cumulative_relative_overshoot: float = 0.0
+    observed_steps: int = 0
+    lingering_peak: float = 0.0
+    decline_streak: int = 0
+    gate_open: bool = False
+
+
+@dataclass(frozen=True)
+class M2ReplayEntropyLingeringEval:
+    entropy_initial: float
+    relative_overshoot: float
+    lingering_score: float
+    lingering_peak: float
+    decline_streak: int
+    gate_open: bool
+
+
+@dataclass(frozen=True)
+class M2ReplayEntropyAreaReturnState:
+    prefix_sum: float = 0.0
+    prefix_count: int = 0
+    baseline_sum_at_peak: float = 0.0
+    baseline_count_at_peak: int = 0
+    peak_entropy: float = 0.0
+    peak_step: int = 0
+    recovery_mass: float = 0.0
+    gate_open: bool = False
+
+
+@dataclass(frozen=True)
+class M2ReplayEntropyAreaReturnEval:
+    baseline_entropy: float
+    peak_entropy: float
+    peak_step: int
+    recovery_mass: float
+    required_recovery_mass: float
+    gate_open: bool
+
+
 def normalize_m2_replay_start_mode(start_mode_cfg: Any, legacy_one_turnover_gate: bool = False) -> str:
     if start_mode_cfg is None or str(start_mode_cfg).strip() == "":
         return "two_turnovers" if legacy_one_turnover_gate else "immediate"
@@ -218,6 +260,192 @@ def compute_m2_replay_start_gate_state(
         two_turnovers_ready=two_turnovers_ready,
         selection_ready=selection_ready,
     )
+
+
+def update_m2_replay_entropy_lingering_state(
+    state: M2ReplayEntropyLingeringState,
+    entropy_value: Optional[float],
+    gate_eligible: bool,
+) -> tuple[M2ReplayEntropyLingeringState, M2ReplayEntropyLingeringEval]:
+    """Track lingering entropy overshoot with a minimal, task-specific replay gate.
+
+    The gate stays off while the running lingering score is still rising, and starts
+    opening once that score turns over. Existing experiments remain unchanged because
+    the feature is disabled by default and only scales replay_target_groups when enabled.
+    """
+
+    if entropy_value is None or not np.isfinite(float(entropy_value)):
+        entropy_initial = float(state.entropy_initial or 0.0)
+        eval_result = M2ReplayEntropyLingeringEval(
+            entropy_initial=entropy_initial,
+            relative_overshoot=0.0,
+            lingering_score=0.0,
+            lingering_peak=float(state.lingering_peak),
+            decline_streak=int(state.decline_streak),
+            gate_open=bool(state.gate_open),
+        )
+        return state, eval_result
+
+    entropy_value = float(entropy_value)
+    if state.entropy_initial is None or state.observed_steps <= 0:
+        entropy_initial = max(entropy_value, 1e-8)
+        next_state = M2ReplayEntropyLingeringState(
+            entropy_initial=entropy_initial,
+            cumulative_relative_overshoot=0.0,
+            observed_steps=1,
+            lingering_peak=0.0,
+            decline_streak=0,
+            gate_open=False,
+        )
+        eval_result = M2ReplayEntropyLingeringEval(
+            entropy_initial=entropy_initial,
+            relative_overshoot=0.0,
+            lingering_score=0.0,
+            lingering_peak=0.0,
+            decline_streak=0,
+            gate_open=False,
+        )
+        return next_state, eval_result
+
+    entropy_initial = max(float(state.entropy_initial), 1e-8)
+    relative_overshoot = max(0.0, entropy_value / entropy_initial - 1.0)
+    observed_steps = int(state.observed_steps) + 1
+    cumulative_relative_overshoot = float(state.cumulative_relative_overshoot) + relative_overshoot
+    lingering_score = cumulative_relative_overshoot / max(observed_steps, 1)
+    lingering_peak = max(float(state.lingering_peak), lingering_score)
+    gate_open = bool(state.gate_open)
+    decline_streak = int(state.decline_streak)
+    if gate_open:
+        pass
+    elif gate_eligible:
+        if lingering_score < lingering_peak:
+            decline_streak += 1
+        else:
+            decline_streak = 0
+        if decline_streak >= 2:
+            gate_open = True
+    else:
+        decline_streak = 0
+
+    next_state = M2ReplayEntropyLingeringState(
+        entropy_initial=entropy_initial,
+        cumulative_relative_overshoot=cumulative_relative_overshoot,
+        observed_steps=observed_steps,
+        lingering_peak=lingering_peak,
+        decline_streak=decline_streak,
+        gate_open=gate_open,
+    )
+    eval_result = M2ReplayEntropyLingeringEval(
+        entropy_initial=entropy_initial,
+        relative_overshoot=relative_overshoot,
+        lingering_score=lingering_score,
+        lingering_peak=lingering_peak,
+        decline_streak=decline_streak,
+        gate_open=gate_open,
+    )
+    return next_state, eval_result
+
+
+def update_m2_replay_entropy_area_return_state(
+    state: M2ReplayEntropyAreaReturnState,
+    entropy_value: Optional[float],
+    *,
+    current_step: int,
+    gate_eligible: bool,
+    multiplier: float,
+) -> tuple[M2ReplayEntropyAreaReturnState, M2ReplayEntropyAreaReturnEval]:
+    """Track post-peak entropy recovery using a parameterized area-return gate."""
+
+    multiplier = max(float(multiplier), 0.0)
+    if entropy_value is None or not np.isfinite(float(entropy_value)):
+        baseline_entropy = (
+            float(state.baseline_sum_at_peak / state.baseline_count_at_peak)
+            if state.baseline_count_at_peak > 0
+            else float(state.peak_entropy)
+        )
+        required_recovery_mass = max(float(state.peak_entropy) - baseline_entropy, 0.0) * multiplier
+        eval_result = M2ReplayEntropyAreaReturnEval(
+            baseline_entropy=baseline_entropy,
+            peak_entropy=float(state.peak_entropy),
+            peak_step=int(state.peak_step),
+            recovery_mass=float(state.recovery_mass),
+            required_recovery_mass=required_recovery_mass,
+            gate_open=bool(state.gate_open),
+        )
+        return state, eval_result
+
+    entropy_value = float(entropy_value)
+    current_step = int(current_step)
+
+    prefix_sum = float(state.prefix_sum) + entropy_value
+    prefix_count = int(state.prefix_count) + 1
+
+    if prefix_count <= 1:
+        next_state = M2ReplayEntropyAreaReturnState(
+            prefix_sum=prefix_sum,
+            prefix_count=prefix_count,
+            baseline_sum_at_peak=prefix_sum,
+            baseline_count_at_peak=prefix_count,
+            peak_entropy=entropy_value,
+            peak_step=current_step,
+            recovery_mass=0.0,
+            gate_open=False,
+        )
+        eval_result = M2ReplayEntropyAreaReturnEval(
+            baseline_entropy=entropy_value,
+            peak_entropy=entropy_value,
+            peak_step=current_step,
+            recovery_mass=0.0,
+            required_recovery_mass=0.0,
+            gate_open=False,
+        )
+        return next_state, eval_result
+
+    peak_entropy = float(state.peak_entropy)
+    peak_step = int(state.peak_step)
+    baseline_sum_at_peak = float(state.baseline_sum_at_peak)
+    baseline_count_at_peak = int(state.baseline_count_at_peak)
+    recovery_mass = float(state.recovery_mass)
+    gate_open = bool(state.gate_open)
+
+    if entropy_value >= peak_entropy:
+        peak_entropy = entropy_value
+        peak_step = current_step
+        baseline_sum_at_peak = prefix_sum
+        baseline_count_at_peak = prefix_count
+        recovery_mass = 0.0 if not gate_open else recovery_mass
+    else:
+        baseline_entropy = (
+            baseline_sum_at_peak / baseline_count_at_peak if baseline_count_at_peak > 0 else peak_entropy
+        )
+        recovery_mass += max(baseline_entropy - entropy_value, 0.0)
+        required_recovery_mass = max(peak_entropy - baseline_entropy, 0.0) * multiplier
+        if (not gate_open) and gate_eligible and current_step > peak_step:
+            if entropy_value <= baseline_entropy and recovery_mass >= required_recovery_mass:
+                gate_open = True
+
+    baseline_entropy = baseline_sum_at_peak / baseline_count_at_peak if baseline_count_at_peak > 0 else peak_entropy
+    required_recovery_mass = max(peak_entropy - baseline_entropy, 0.0) * multiplier
+
+    next_state = M2ReplayEntropyAreaReturnState(
+        prefix_sum=prefix_sum,
+        prefix_count=prefix_count,
+        baseline_sum_at_peak=baseline_sum_at_peak,
+        baseline_count_at_peak=baseline_count_at_peak,
+        peak_entropy=peak_entropy,
+        peak_step=peak_step,
+        recovery_mass=recovery_mass,
+        gate_open=gate_open,
+    )
+    eval_result = M2ReplayEntropyAreaReturnEval(
+        baseline_entropy=baseline_entropy,
+        peak_entropy=peak_entropy,
+        peak_step=peak_step,
+        recovery_mass=recovery_mass,
+        required_recovery_mass=required_recovery_mass,
+        gate_open=gate_open,
+    )
+    return next_state, eval_result
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -468,6 +696,8 @@ class RayPPOTrainer:
         self.m2_replay_floor_to_micro = True
         self.m2_replay_selection_mode = "legacy_uncertainty_recency"
         self.m2_replay_ingress_filter_mode = "none"
+        self.m2_replay_ingress_success_score_threshold: Optional[float] = None
+        self.m2_replay_ingress_tool_response_pair_fraction_min: Optional[float] = None
         self.m2_replay_replay_target_groups: Optional[int] = None
         self.m2_replay_recent_learning_beta = 1.0
         self.m2_replay_recent_learning_decay_lambda = 4.0
@@ -491,6 +721,11 @@ class RayPPOTrainer:
         self.m2_replay_start_mode = "immediate"
         self.m2_replay_one_turnover_gate = False
         self.m2_replay_adv_zero_eps = 1e-8
+        self.m2_replay_entropy_lingering_enabled = False
+        self.m2_replay_entropy_lingering_state = M2ReplayEntropyLingeringState()
+        self.m2_replay_entropy_area_return_enabled = False
+        self.m2_replay_entropy_area_return_multiplier = 2.0
+        self.m2_replay_entropy_area_return_state = M2ReplayEntropyAreaReturnState()
         self.m2_replay_buffer: Optional[QueryGroupReplayBuffer] = None
         self.m2_replay_needs_buffer_zvp_backfill = False
         self.m2_replay_query_use_count: dict[str, int] = defaultdict(int)
@@ -531,6 +766,20 @@ class RayPPOTrainer:
                     "Fallback to none.",
                     flush=True,
                 )
+            ingress_success_threshold_cfg = selection_cfg.get("ingress_success_score_threshold", None)
+            if ingress_success_threshold_cfg is None:
+                self.m2_replay_ingress_success_score_threshold = None
+            else:
+                self.m2_replay_ingress_success_score_threshold = float(ingress_success_threshold_cfg)
+            ingress_tool_pair_fraction_cfg = selection_cfg.get("ingress_tool_response_pair_fraction_min", None)
+            if ingress_tool_pair_fraction_cfg is None:
+                self.m2_replay_ingress_tool_response_pair_fraction_min = None
+            else:
+                parsed_tool_pair_fraction = float(ingress_tool_pair_fraction_cfg)
+                if parsed_tool_pair_fraction <= 0:
+                    self.m2_replay_ingress_tool_response_pair_fraction_min = None
+                else:
+                    self.m2_replay_ingress_tool_response_pair_fraction_min = min(parsed_tool_pair_fraction, 1.0)
             self.m2_replay_recent_learning_beta = float(selection_cfg.get("recent_learning_beta", 1.0))
             self.m2_replay_recent_learning_decay_lambda = float(
                 selection_cfg.get("recent_learning_decay_lambda", 4.0)
@@ -622,6 +871,8 @@ class RayPPOTrainer:
                 )
                 self.m2_replay_fixed_total_floor_groups = 0
             start_mode_cfg = schedule_cfg.get("start_mode", None)
+            entropy_lingering_cfg = schedule_cfg.get("entropy_lingering", {})
+            entropy_area_return_cfg = schedule_cfg.get("entropy_area_return", {})
             legacy_one_turnover_gate = bool(schedule_cfg.get("one_turnover_gate", False))
             raw_start_mode = "" if start_mode_cfg is None else str(start_mode_cfg).strip().lower()
             start_mode_raw = normalize_m2_replay_start_mode(
@@ -636,6 +887,14 @@ class RayPPOTrainer:
                 )
             self.m2_replay_start_mode = start_mode_raw
             self.m2_replay_one_turnover_gate = self.m2_replay_start_mode == "two_turnovers"
+            self.m2_replay_entropy_lingering_enabled = bool(entropy_lingering_cfg.get("enable", False))
+            self.m2_replay_entropy_lingering_state = M2ReplayEntropyLingeringState()
+            self.m2_replay_entropy_area_return_enabled = bool(entropy_area_return_cfg.get("enable", False))
+            self.m2_replay_entropy_area_return_multiplier = max(
+                float(entropy_area_return_cfg.get("multiplier", 2.0)),
+                0.0,
+            )
+            self.m2_replay_entropy_area_return_state = M2ReplayEntropyAreaReturnState()
             self.m2_replay_prefix = str(logging_cfg.get("prefix", "m2_replay"))
             self.m2_replay_dump_full_scores = bool(logging_cfg.get("dump_full_scores", False))
             custom_full_scores_dir = logging_cfg.get("full_scores_dir", None)
@@ -1900,34 +2159,41 @@ class RayPPOTrainer:
 
         onpolicy_train_group_count = len(onpolicy_query_ids)
         if onpolicy_train_group_count <= 0:
-            metrics[self._m2_key("pass2/selected_groups")] = 0.0
-            metrics[self._m2_key("pass2/used_groups")] = 0.0
             metrics[self._m2_key("buffer/size")] = float(len(self.m2_replay_buffer))
             return batch
 
         # Build full on-policy groups once; derive ingress subset via filter.
         with marked_timer("m2_prepare_onpolicy_groups", m2_timing_raw, color="yellow"):
+            ingress_success_score_threshold = getattr(
+                self,
+                "m2_replay_ingress_success_score_threshold",
+                None,
+            )
             ingress_success_count_min, ingress_success_count_max = derive_ingress_success_band(
                 rollout_n=rollout_n,
                 ingress_filter_mode=self.m2_replay_ingress_filter_mode,
             )
             should_init_onpolicy_zvp = self.m2_replay_selection_mode == "zvp_recency"
+            skipped_by_tool_pair_fraction = 0
             if self.m2_replay_training_mode == "fixed_total_with_adv0_drop":
                 _t0 = time.perf_counter()
                 group_build_result = build_query_groups_from_onpolicy_batch(
                     batch=batch,
                     expected_group_size=rollout_n,
                     insertion_step=self.global_steps,
+                    success_score_threshold=ingress_success_score_threshold,
+                    tool_response_pair_fraction_min=self.m2_replay_ingress_tool_response_pair_fraction_min,
                     zvp_lambda_neg=self.m2_replay_zvp_lambda_neg,
                     zvp_mode=self.m2_replay_zvp_mode,
                     compute_zvp_stats=False,
                 )
                 m2_timing_raw["m2_prepare_group_build"] = m2_timing_raw.get("m2_prepare_group_build", 0.0) + (time.perf_counter() - _t0)
                 onpolicy_all_groups = group_build_result.groups
-                onpolicy_ingress_groups, skipped_by_success_band = filter_query_groups_for_ingress(
+                onpolicy_ingress_groups, skipped_by_success_band, skipped_by_tool_pair_fraction = filter_query_groups_for_ingress(
                     groups=onpolicy_all_groups,
                     rollout_n=rollout_n,
                     ingress_filter_mode=self.m2_replay_ingress_filter_mode,
+                    tool_response_pair_fraction_min=self.m2_replay_ingress_tool_response_pair_fraction_min,
                 )
                 if should_init_onpolicy_zvp and onpolicy_ingress_groups:
                     _t0 = time.perf_counter()
@@ -1952,6 +2218,8 @@ class RayPPOTrainer:
                     insertion_step=self.global_steps,
                     success_count_min=ingress_success_count_min,
                     success_count_max=ingress_success_count_max,
+                    success_score_threshold=ingress_success_score_threshold,
+                    tool_response_pair_fraction_min=self.m2_replay_ingress_tool_response_pair_fraction_min,
                     zvp_lambda_neg=self.m2_replay_zvp_lambda_neg,
                     zvp_mode=self.m2_replay_zvp_mode,
                     compute_zvp_stats=should_init_onpolicy_zvp,
@@ -1959,12 +2227,14 @@ class RayPPOTrainer:
                 m2_timing_raw["m2_prepare_group_build"] = m2_timing_raw.get("m2_prepare_group_build", 0.0) + (time.perf_counter() - _t0)
                 onpolicy_ingress_groups = group_build_result.groups
                 skipped_by_success_band = group_build_result.skipped_by_success_band
+                skipped_by_tool_pair_fraction = group_build_result.skipped_by_tool_pair_fraction
                 onpolicy_all_groups = onpolicy_ingress_groups
 
         metrics[self._m2_key("buffer/new_groups")] = float(len(onpolicy_ingress_groups))
         metrics[self._m2_key("buffer/skipped_incomplete")] = float(group_build_result.skipped_incomplete)
         metrics[self._m2_key("buffer/skipped_missing_train_keys")] = float(group_build_result.skipped_missing_train_keys)
         metrics[self._m2_key("buffer/skipped_by_success_band")] = float(skipped_by_success_band)
+        metrics[self._m2_key("buffer/skipped_by_tool_pair_fraction")] = float(skipped_by_tool_pair_fraction)
 
         onpolicy_ingress_query_ids = [group.query_id for group in onpolicy_ingress_groups]
         ingress_group_count = len(onpolicy_ingress_query_ids)
@@ -2002,11 +2272,6 @@ class RayPPOTrainer:
             if len(onpolicy_nonzero_groups) > fixed_total_groups:
                 onpolicy_nonzero_groups = onpolicy_nonzero_groups[:fixed_total_groups]
             replay_target_groups = max(fixed_total_groups - len(onpolicy_nonzero_groups), 0)
-            metrics[self._m2_key("selection/onpolicy_nonzero_groups")] = float(len(onpolicy_nonzero_groups))
-            metrics[self._m2_key("selection/onpolicy_adv0_groups")] = float(len(onpolicy_adv0_groups))
-            metrics[self._m2_key("selection/replay_need")] = float(replay_target_groups)
-            metrics[self._m2_key("selection/fixed_total_groups")] = float(fixed_total_groups)
-            metrics[self._m2_key("selection/fixed_total_floor_groups")] = float(fixed_total_floor_groups)
         else:
             replay_target_groups = (
                 int(self.m2_replay_replay_target_groups)
@@ -2014,34 +2279,8 @@ class RayPPOTrainer:
                 else int(ingress_group_count)
             )
 
-        metrics[self._m2_key("schedule/onpolicy_train_groups")] = float(onpolicy_train_group_count)
         metrics[self._m2_key("schedule/onpolicy_ingress_groups")] = float(ingress_group_count)
-        metrics[self._m2_key("schedule/replay_target_groups")] = float(replay_target_groups)
-        effective_log_prob_micro_batch = (
-            int(self.m2_replay_log_prob_micro_batch_size_per_gpu)
-            if self.m2_replay_log_prob_micro_batch_size_per_gpu is not None
-            else int(self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu)
-        )
-        metrics[self._m2_key("selection/log_prob_micro_batch_size_per_gpu")] = float(effective_log_prob_micro_batch)
-        effective_log_prob_dynamic_bsz = (
-            self.m2_replay_log_prob_use_dynamic_bsz
-            if self.m2_replay_log_prob_use_dynamic_bsz is not None
-            else self.config.actor_rollout_ref.rollout.log_prob_use_dynamic_bsz
-        )
-        metrics[self._m2_key("selection/log_prob_use_dynamic_bsz")] = float(bool(effective_log_prob_dynamic_bsz))
-        effective_log_prob_max_token_len = (
-            self.m2_replay_log_prob_max_token_len_per_gpu
-            if self.m2_replay_log_prob_max_token_len_per_gpu is not None
-            else self.config.actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu
-        )
-        if effective_log_prob_max_token_len is not None:
-            metrics[self._m2_key("selection/log_prob_max_token_len_per_gpu")] = float(
-                int(effective_log_prob_max_token_len)
-            )
-        metrics[self._m2_key("selection/runtime_zvp_enabled")] = float(bool(self.m2_replay_compute_runtime_zvp))
-        metrics[self._m2_key("selection/gpu_m2_fastpath_enabled")] = float(
-            bool(self.m2_replay_gpu_m2_fastpath and self.use_legacy_worker_impl != "disable")
-        )
+        metrics[self._m2_key("schedule/replay_target_groups_base")] = float(max(int(replay_target_groups), 0))
 
         buffer_size_pre_select = len(self.m2_replay_buffer)
         buffer_capacity = int(self.m2_replay_buffer.max_query_groups)
@@ -2052,28 +2291,60 @@ class RayPPOTrainer:
             buffer_capacity=buffer_capacity,
             buffer_inserted=buffer_inserted,
         )
-        buffer_full_ready = start_gate_state.buffer_full_ready
-        two_turnovers_ready = start_gate_state.two_turnovers_ready
         selection_ready = start_gate_state.selection_ready
-        metrics[self._m2_key("gating/start_mode_immediate")] = float(self.m2_replay_start_mode == "immediate")
-        metrics[self._m2_key("gating/start_mode_quarter")] = float(self.m2_replay_start_mode == "quarter")
-        metrics[self._m2_key("gating/start_mode_half")] = float(self.m2_replay_start_mode == "half")
-        metrics[self._m2_key("gating/start_mode_buffer_full")] = float(self.m2_replay_start_mode == "buffer_full")
-        metrics[self._m2_key("gating/start_mode_two_turnovers")] = float(
-            self.m2_replay_start_mode == "two_turnovers"
+
+        if self.m2_replay_entropy_area_return_enabled:
+            entropy_value = metrics.get("actor/entropy", None)
+            entropy_state, entropy_eval = update_m2_replay_entropy_area_return_state(
+                state=self.m2_replay_entropy_area_return_state,
+                entropy_value=entropy_value,
+                current_step=self.global_steps,
+                gate_eligible=selection_ready,
+                multiplier=self.m2_replay_entropy_area_return_multiplier,
+            )
+            self.m2_replay_entropy_area_return_state = entropy_state
+            selection_ready = bool(selection_ready and entropy_eval.gate_open)
+            metrics.update(
+                {
+                    self._m2_key("schedule/entropy_area_return_enabled"): 1.0,
+                    self._m2_key("schedule/entropy_area_return_multiplier"): float(
+                        self.m2_replay_entropy_area_return_multiplier
+                    ),
+                    self._m2_key("schedule/entropy_area_return_baseline"): float(entropy_eval.baseline_entropy),
+                    self._m2_key("schedule/entropy_area_return_peak_entropy"): float(entropy_eval.peak_entropy),
+                    self._m2_key("schedule/entropy_area_return_peak_step"): float(entropy_eval.peak_step),
+                    self._m2_key("schedule/entropy_area_return_recovery_mass"): float(entropy_eval.recovery_mass),
+                    self._m2_key("schedule/entropy_area_return_required_mass"): float(
+                        entropy_eval.required_recovery_mass
+                    ),
+                    self._m2_key("schedule/entropy_area_return_gate_open"): float(entropy_eval.gate_open),
+                }
+            )
+        elif self.m2_replay_entropy_lingering_enabled:
+            entropy_value = metrics.get("actor/entropy", None)
+            entropy_state, entropy_eval = update_m2_replay_entropy_lingering_state(
+                state=self.m2_replay_entropy_lingering_state,
+                entropy_value=entropy_value,
+                gate_eligible=selection_ready,
+            )
+            self.m2_replay_entropy_lingering_state = entropy_state
+            selection_ready = bool(selection_ready and entropy_eval.gate_open)
+            metrics.update(
+                {
+                    self._m2_key("schedule/entropy_lingering_enabled"): 1.0,
+                    self._m2_key("schedule/entropy_lingering_entropy_initial"): float(entropy_eval.entropy_initial),
+                    self._m2_key("schedule/entropy_lingering_relative_overshoot"): float(
+                        entropy_eval.relative_overshoot
+                    ),
+                    self._m2_key("schedule/entropy_lingering_score"): float(entropy_eval.lingering_score),
+                    self._m2_key("schedule/entropy_lingering_peak"): float(entropy_eval.lingering_peak),
+                    self._m2_key("schedule/entropy_lingering_decline_streak"): float(entropy_eval.decline_streak),
+                    self._m2_key("schedule/entropy_lingering_gate_open"): float(entropy_eval.gate_open),
+                }
+            )
+        metrics[self._m2_key("schedule/replay_target_groups_effective")] = float(
+            max(int(replay_target_groups), 0) if selection_ready else 0.0
         )
-        metrics[self._m2_key("gating/quarter_threshold_groups")] = float(start_gate_state.quarter_threshold)
-        metrics[self._m2_key("gating/half_threshold_groups")] = float(start_gate_state.half_threshold)
-        metrics[self._m2_key("gating/quarter_ready")] = float(bool(start_gate_state.quarter_ready))
-        metrics[self._m2_key("gating/half_ready")] = float(bool(start_gate_state.half_ready))
-        metrics[self._m2_key("gating/buffer_full_ready")] = float(bool(buffer_full_ready))
-        metrics[self._m2_key("gating/two_turnovers_ready")] = float(bool(two_turnovers_ready))
-        metrics[self._m2_key("gating/selection_ready")] = float(bool(selection_ready))
-        metrics[self._m2_key("gating/one_turnover_enabled")] = float(bool(self.m2_replay_one_turnover_gate))
-        metrics[self._m2_key("gating/one_turnover_ready")] = float(bool(two_turnovers_ready))
-        metrics[self._m2_key("gating/buffer_size_pre_select")] = float(buffer_size_pre_select)
-        metrics[self._m2_key("gating/buffer_capacity")] = float(buffer_capacity)
-        metrics[self._m2_key("gating/buffer_inserted_pre_select")] = float(buffer_inserted)
 
         with marked_timer("m2_select_replay_total", m2_timing_raw, color="yellow"):
             if not selection_ready:
@@ -2087,16 +2358,13 @@ class RayPPOTrainer:
                 )
             else:
                 if self.m2_replay_selection_mode == "zvp_recency" and self.m2_replay_needs_buffer_zvp_backfill:
-                    backfilled_groups = update_query_groups_zvp_stats(
+                    update_query_groups_zvp_stats(
                         self.m2_replay_buffer.items(),
                         lambda_neg=self.m2_replay_zvp_lambda_neg,
                         zvp_mode=self.m2_replay_zvp_mode,
                         only_missing=True,
                     )
                     self.m2_replay_needs_buffer_zvp_backfill = False
-                    metrics[self._m2_key("gating/backfilled_buffer_groups")] = float(backfilled_groups)
-                else:
-                    metrics[self._m2_key("gating/backfilled_buffer_groups")] = 0.0
                 selection = select_replay_groups(
                     buffer=self.m2_replay_buffer,
                     target_groups=replay_target_groups,
@@ -2123,8 +2391,6 @@ class RayPPOTrainer:
                     build_candidate_priority_all=self.m2_replay_dump_full_scores,
                     timing_raw=m2_timing_raw,
                 )
-        if not selection_ready:
-            metrics[self._m2_key("gating/backfilled_buffer_groups")] = 0.0
         metrics.update(selection.to_metrics(prefix=self.m2_replay_prefix))
 
         replay_groups = selection.selected_groups
@@ -2178,37 +2444,22 @@ class RayPPOTrainer:
                 group.zvp_last_update_step = int(self.global_steps)
                 group.zvp_update_count = int(group.zvp_update_count) + 1
             group.last_training_step = int(self.global_steps)
-        metrics[self._m2_key("pass2/selected_groups")] = float(selected_groups)
-        metrics[self._m2_key("pass2/used_groups")] = float(len(replay_groups))
-        metrics[self._m2_key("selection/replay_used")] = float(len(replay_groups))
-        metrics[self._m2_key("selection/replay_trimmed_for_floor")] = float(replay_trimmed_for_floor)
-        metrics[self._m2_key("selection/fixed_total_target_applied")] = float(applied_total_groups)
-        if replay_groups:
-            metrics[self._m2_key("selection/used_zvp_mean")] = float(
-                sum(float(group.zvp_score) for group in replay_groups) / len(replay_groups)
-            )
-            metrics[self._m2_key("selection/used_zvp_surprisal_mean")] = float(
-                sum(float(group.zvp_mean_surprisal) for group in replay_groups) / len(replay_groups)
-            )
-            metrics[self._m2_key("selection/used_zvp_neg_frac_mean")] = float(
-                sum(float(group.zvp_neg_frac) for group in replay_groups) / len(replay_groups)
-            )
-            metrics[self._m2_key("selection/used_zvp_pos_frac_mean")] = float(
-                sum(float(group.zvp_pos_frac) for group in replay_groups) / len(replay_groups)
-            )
-        else:
-            metrics[self._m2_key("selection/used_zvp_mean")] = 0.0
-            metrics[self._m2_key("selection/used_zvp_surprisal_mean")] = 0.0
-            metrics[self._m2_key("selection/used_zvp_neg_frac_mean")] = 0.0
-            metrics[self._m2_key("selection/used_zvp_pos_frac_mean")] = 0.0
+
+        # Update ZVP for M2-rejected groups using already-computed new_log_probs (overwrite, not EMA).
+        for rej_group, rej_stats in selection.rejected_by_tau_zvp_updates:
+            rej_score, rej_ms, rej_nf, rej_pf = rej_stats
+            rej_group.zvp_score = rej_score
+            rej_group.zvp_mean_surprisal = rej_ms
+            rej_group.zvp_neg_frac = rej_nf
+            rej_group.zvp_pos_frac = rej_pf
+            rej_group.zvp_last_update_step = int(self.global_steps)
+            rej_group.zvp_update_count = int(rej_group.zvp_update_count) + 1
 
         if self.m2_replay_training_mode == "fixed_total_with_adv0_drop":
             fallback_needed = max(applied_total_groups - len(onpolicy_nonzero_groups) - len(replay_groups), 0)
             fallback_adv0_groups = onpolicy_adv0_groups[:fallback_needed]
             onpolicy_actor_groups = onpolicy_nonzero_groups + fallback_adv0_groups
             final_train_groups = len(onpolicy_actor_groups) + len(replay_groups)
-            metrics[self._m2_key("selection/fallback_adv0_used")] = float(len(fallback_adv0_groups))
-            metrics[self._m2_key("selection/final_train_groups")] = float(final_train_groups)
             if final_train_groups < applied_total_groups:
                 print(
                     "[m2_replay] Warning: fixed-total mode underfilled actor batch "
@@ -2219,60 +2470,13 @@ class RayPPOTrainer:
             onpolicy_actor_groups = onpolicy_all_groups
             final_train_groups = onpolicy_train_group_count + len(replay_groups)
 
-        metrics[self._m2_key("selection/final_train_groups")] = float(final_train_groups)
-
-        # Lightweight debug print for quickly inspecting selected query groups
-        # and their replay reuse frequency.
-        replay_query_ids = [group.query_id for group in replay_groups]
-        for qid in replay_query_ids:
-            self.m2_replay_query_use_count[qid] += 1
-        top_replayed = sorted(
-            self.m2_replay_query_use_count.items(),
-            key=lambda kv: (-kv[1], str(kv[0])),
-        )[:10]
-        preview_limit = 20
-        onpolicy_preview = onpolicy_query_ids[:preview_limit]
-        replay_preview = replay_query_ids[:preview_limit]
-        score_preview_limit = 10
-        if self.m2_replay_training_mode == "fixed_total_with_adv0_drop":
-            onpolicy_nonzero_count = len(onpolicy_nonzero_groups)
-            nonzero_preview = [group.query_id for group in onpolicy_nonzero_groups[:preview_limit]]
-        else:
-            onpolicy_nonzero_count = onpolicy_train_group_count
-            nonzero_preview = onpolicy_query_ids[:preview_limit]
-        fallback_adv0_preview = [group.query_id for group in fallback_adv0_groups[:preview_limit]]
-
-        def _round_score_entry(entry: dict[str, object]) -> dict[str, object]:
-            rounded = dict(entry)
-            for key in [
-                "score",
-                "uncertainty",
-                "recency_value",
-                "success_prob",
-                "m2",
-                "zvp_score",
-                "zvp_runtime_score",
-                "zvp_runtime_mean_surprisal",
-                "zvp_runtime_neg_frac",
-                "zvp_runtime_pos_frac",
-            ]:
-                if key in rounded:
-                    rounded[key] = round(float(rounded[key]), 6)
-            return rounded
-
-        candidate_score_preview = [
-            _round_score_entry(entry) for entry in selection.candidate_priority_preview[:score_preview_limit]
-        ]
-        used_score_preview = [
-            _round_score_entry(entry) for entry in selection.selected_priority_debug[: len(replay_groups)]
-        ][:score_preview_limit]
         with marked_timer("m2_dump_full_scores", m2_timing_raw, color="yellow"):
             self._m2_dump_full_scores(
                 selection=selection,
                 group_build_result=group_build_result,
-                onpolicy_query_ids=onpolicy_query_ids,
                 onpolicy_ingress_query_ids=onpolicy_ingress_query_ids,
-                replay_query_ids=replay_query_ids,
+                onpolicy_query_ids=onpolicy_query_ids,
+                replay_query_ids=[group.query_id for group in replay_groups],
                 onpolicy_train_groups=onpolicy_train_group_count,
                 replay_target_groups=replay_target_groups,
                 selected_groups=selected_groups,
@@ -2288,53 +2492,32 @@ class RayPPOTrainer:
                     "final_train_groups": int(final_train_groups),
                 },
             )
-        print(
-            "[m2_replay] "
-            f"step={self.global_steps} "
-            f"start_mode={self.m2_replay_start_mode} "
-            f"onpolicy_groups={onpolicy_train_group_count} "
-            f"onpolicy_ingress_groups={len(onpolicy_ingress_query_ids)} "
-            f"training_mode={self.m2_replay_training_mode} "
-            f"replay_target={replay_target_groups} "
-            f"replay_selected={selected_groups} "
-            f"replay_used={len(replay_query_ids)} "
-            f"fixed_total_target_applied={applied_total_groups} "
-            f"replay_trimmed_for_floor={replay_trimmed_for_floor} "
-            f"onpolicy_nonzero={onpolicy_nonzero_count} "
-            f"onpolicy_adv0={len(onpolicy_adv0_groups)} "
-            f"fallback_adv0_used={len(fallback_adv0_groups)} "
-            f"final_train_groups={final_train_groups} "
-            f"onpolicy_query_ids(first_{preview_limit})={onpolicy_preview} "
-            f"onpolicy_ingress_query_ids(first_{preview_limit})={onpolicy_ingress_query_ids[:preview_limit]} "
-            f"onpolicy_nonzero_query_ids(first_{preview_limit})={nonzero_preview} "
-            f"fallback_adv0_query_ids(first_{preview_limit})={fallback_adv0_preview} "
-            f"replay_query_ids(first_{preview_limit})={replay_preview} "
-            f"top_replayed_query_ids={top_replayed}",
-            flush=True,
-        )
-        print(
-            "[m2_replay_scores] "
-            f"step={self.global_steps} "
-            f"mode={self.m2_replay_selection_mode} "
-            f"ingress_filter={self.m2_replay_ingress_filter_mode} "
-            f"beta={self.m2_replay_recent_learning_beta} "
-            f"lambda={self.m2_replay_recent_learning_decay_lambda} "
-            f"zvp_weight={self.m2_replay_zvp_weight} "
-            f"zvp_ema_alpha={self.m2_replay_zvp_ema_alpha} "
-            f"zvp_lambda_neg={self.m2_replay_zvp_lambda_neg} "
-            f"zvp_use_recency={self.m2_replay_zvp_use_recency} "
-            f"zvp_mode={self.m2_replay_zvp_mode} "
-            f"log_prob_micro_batch_size_per_gpu={effective_log_prob_micro_batch} "
-            f"candidate_scores(first_{score_preview_limit})={candidate_score_preview} "
-            f"used_replay_scores(first_{score_preview_limit})={used_score_preview}",
-            flush=True,
-        )
 
         # Append current on-policy groups after replay selection so same-step groups
         # are not sampled as replay in this iteration.
         with marked_timer("m2_buffer_append", m2_timing_raw, color="yellow"):
             self.m2_replay_buffer.append_groups(onpolicy_ingress_groups)
         metrics[self._m2_key("buffer/size")] = float(len(self.m2_replay_buffer))
+
+        used_zvp_mean = (
+            float(sum(float(group.zvp_score) for group in replay_groups) / len(replay_groups)) if replay_groups else 0.0
+        )
+        metrics[self._m2_key("selection/replay_used")] = float(len(replay_groups))
+        metrics[self._m2_key("selection/used_zvp_mean")] = used_zvp_mean
+        print(
+            "[m2_replay] "
+            f"step={self.global_steps} "
+            f"ingress={ingress_group_count} "
+            f"skipped_by_success_band={skipped_by_success_band} "
+            f"buffer={len(self.m2_replay_buffer)} "
+            f"scanned={selection.scanned_groups} "
+            f"accepted={selected_groups} "
+            f"rejected_by_tau={selection.rejected_by_tau} "
+            f"replay_used={len(replay_groups)} "
+            f"accepted_m2_mean={metrics[self._m2_key('pass1/accepted_m2_mean')]:.6f} "
+            f"used_zvp_mean={used_zvp_mean:.6f}",
+            flush=True,
+        )
 
         with marked_timer("m2_actor_batch_concat", m2_timing_raw, color="yellow"):
             if self.m2_replay_training_mode == "fixed_total_with_adv0_drop":
