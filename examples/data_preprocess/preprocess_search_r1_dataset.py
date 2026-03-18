@@ -33,7 +33,7 @@ DEFAULT_SYSTEM_CONTENT = "You are a helpful and harmless assistant."
 DEFAULT_USER_CONTENT_PREFIX = (
     "Answer the given question. You must conduct reasoning inside <think> and </think> "
     "first every time you get new information. After reasoning, if you find you lack "
-    "some knowledge, you can call a search engine by <tool_call> query </tool_call> "
+    "some knowledge, you can call a search engine by <search> query </search> "
     "and it will return the top searched results between <tool_response> and "
     "</tool_response>. You can search as many times as your want. If you find no "
     "further external knowledge needed, you can directly provide the answer inside "

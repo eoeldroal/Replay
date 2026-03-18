@@ -1,0 +1,22 @@
+tools:
+  - class_name: verl.tools.search_tool.SearchTool
+    config:
+      type: native
+      retrieval_service_url: http://127.0.0.1:8000/retrieve
+      use_ray_pool: false
+      num_workers: 64
+      rate_limit: 64
+      timeout: 30
+    tool_schema:
+      type: function
+      function:
+        name: search
+        description: Searches the retrieval corpus for relevant text passages.
+        parameters:
+          type: object
+          properties:
+            query:
+              type: string
+              description: A single search query string.
+          required:
+            - query
