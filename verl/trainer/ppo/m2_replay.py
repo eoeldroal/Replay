@@ -578,6 +578,11 @@ def _candidate_sort_key(
     zvp_weight: float,
     zvp_use_recency: bool,
 ) -> tuple[float, int, int]:
+    if selection_mode == "m2_only":
+        insertion_order = int(group.insertion_order)
+        seed_rank = _stable_seed_rank(group.query_id, seed)
+        return (0.0, insertion_order, seed_rank)
+
     priority_score, _, _, _, _ = _priority_terms(
         group=group,
         current_step=current_step,
@@ -610,6 +615,10 @@ def _priority_terms(
         priority_score = float(last_training_step)
         uncertainty = 0.0
         recency_value = float(last_training_step)
+    elif selection_mode == "m2_only":
+        priority_score = 0.0
+        uncertainty = 0.0
+        recency_value = 0.0
     elif selection_mode == "zvp_recency":
         # Lower score is selected first, so negate ZVP term.
         zvp_term = max(float(group.zvp_score), 0.0)
@@ -671,7 +680,7 @@ def select_replay_groups(
 
     candidates = buffer.items()
     normalized_mode = str(selection_mode).strip().lower()
-    if normalized_mode not in {"legacy_uncertainty_recency", "recency_only", "zvp_recency"}:
+    if normalized_mode not in {"legacy_uncertainty_recency", "recency_only", "zvp_recency", "m2_only"}:
         normalized_mode = "legacy_uncertainty_recency"
     normalized_zvp_mode = normalize_zvp_mode(zvp_mode)
     t0 = time.perf_counter()
@@ -762,7 +771,7 @@ def select_replay_groups(
         )
         debug_entry = {
             "query_id": group.query_id,
-            "score": priority_score,
+            "score": float(m2) if normalized_mode == "m2_only" else priority_score,
             "uncertainty": uncertainty,
             "recency_value": recency_value,
             "age": age,
@@ -833,6 +842,20 @@ def select_replay_groups(
         m2_by_valid_index: list[float],
     ) -> list[int]:
         nonlocal scanned_groups, rejected_missing_fields, rejected_by_tau
+        if normalized_mode == "m2_only":
+            accepted_valid_indices: list[int] = []
+            for valid_idx in candidate_valid_indices:
+                scanned_groups += 1
+                if valid_idx is None:
+                    rejected_missing_fields += 1
+                    continue
+                if float(m2_by_valid_index[valid_idx]) <= float(tau):
+                    accepted_valid_indices.append(valid_idx)
+                else:
+                    rejected_by_tau += 1
+            accepted_valid_indices.sort(key=lambda idx: (float(m2_by_valid_index[idx]), int(idx)))
+            return accepted_valid_indices[:target_groups]
+
         selected_valid_indices: list[int] = []
         for valid_idx in candidate_valid_indices:
             if len(selected_valid_indices) >= target_groups:
@@ -899,26 +922,80 @@ def select_replay_groups(
 
     loop_start = time.perf_counter()
     if not use_chunked_logprob:
-        for group in scan_candidates:
-            if len(selected) >= target_groups:
-                break
-            scanned_groups += 1
+        if normalized_mode == "m2_only":
+            pending_selected: list[tuple[float, QueryGroup, Optional[tuple[float, float, float, float]]]] = []
+            for group in scan_candidates:
+                scanned_groups += 1
 
-            if group.data.batch is None or not required_fields.issubset(set(group.data.batch.keys())):
-                rejected_missing_fields += 1
-                continue
+                if group.data.batch is None or not required_fields.issubset(set(group.data.batch.keys())):
+                    rejected_missing_fields += 1
+                    continue
 
-            try:
-                t0 = time.perf_counter()
-                new_log_probs = compute_new_log_probs_fn(group.data)
-                if timing_raw is not None:
-                    timing_raw["m2_select_logprob_eval"] = timing_raw.get("m2_select_logprob_eval", 0.0) + (
-                        time.perf_counter() - t0
-                    )
-                _accept_if_passing_tau(group, new_log_probs)
-            except Exception:
-                rejected_eval_error += 1
-                continue
+                try:
+                    t0 = time.perf_counter()
+                    new_log_probs = compute_new_log_probs_fn(group.data)
+                    if timing_raw is not None:
+                        timing_raw["m2_select_logprob_eval"] = timing_raw.get("m2_select_logprob_eval", 0.0) + (
+                            time.perf_counter() - t0
+                        )
+                    t0 = time.perf_counter()
+                    old_log_probs = group.data.batch["old_log_probs"]
+                    response_mask = group.data.batch["response_mask"]
+                    m2 = compute_group_m2(old_log_probs=old_log_probs, new_log_probs=new_log_probs, response_mask=response_mask)
+                    runtime_stats = None
+                    if m2 <= tau:
+                        if compute_runtime_zvp and "advantages" in group.data.batch.keys():
+                            runtime_stats = compute_group_runtime_zvp_stats_batched(
+                                [group],
+                                [new_log_probs],
+                                adv_pos_eps=adv_pos_eps,
+                                lambda_neg=zvp_lambda_neg,
+                                zvp_mode=normalized_zvp_mode,
+                            )[0]
+                        pending_selected.append((float(m2), group, runtime_stats))
+                    else:
+                        rejected_by_tau += 1
+                        if compute_runtime_zvp and "advantages" in group.data.batch.keys():
+                            rej_zvp = compute_group_runtime_zvp_stats_batched(
+                                [group],
+                                [new_log_probs],
+                                adv_pos_eps=adv_pos_eps,
+                                lambda_neg=zvp_lambda_neg,
+                                zvp_mode=normalized_zvp_mode,
+                            )[0]
+                            rejected_zvp_updates.append((group, rej_zvp))
+                    if timing_raw is not None:
+                        timing_raw["m2_select_m2_eval"] = timing_raw.get("m2_select_m2_eval", 0.0) + (
+                            time.perf_counter() - t0
+                        )
+                except Exception:
+                    rejected_eval_error += 1
+                    continue
+
+            pending_selected.sort(key=lambda item: (item[0], int(item[1].insertion_order)))
+            for m2, group, runtime_stats in pending_selected[:target_groups]:
+                _append_selected_group(group, m2=float(m2), runtime_stats=runtime_stats)
+        else:
+            for group in scan_candidates:
+                if len(selected) >= target_groups:
+                    break
+                scanned_groups += 1
+
+                if group.data.batch is None or not required_fields.issubset(set(group.data.batch.keys())):
+                    rejected_missing_fields += 1
+                    continue
+
+                try:
+                    t0 = time.perf_counter()
+                    new_log_probs = compute_new_log_probs_fn(group.data)
+                    if timing_raw is not None:
+                        timing_raw["m2_select_logprob_eval"] = timing_raw.get("m2_select_logprob_eval", 0.0) + (
+                            time.perf_counter() - t0
+                        )
+                    _accept_if_passing_tau(group, new_log_probs)
+                except Exception:
+                    rejected_eval_error += 1
+                    continue
     else:
         candidate_valid_indices, valid_groups = _build_scan_entries(scan_candidates)
 

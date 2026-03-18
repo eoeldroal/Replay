@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 
 from verl import DataProto
@@ -180,3 +181,24 @@ def test_chunked_path_respects_max_scan_limit():
 
     assert result_chunked.scanned_groups == 6
     assert [g.query_id for g in result_chunked.selected_groups] == [f"q{i}" for i in range(1, 7)]
+
+
+def test_chunked_m2_only_prefers_lowest_m2_candidates():
+    buffer = QueryGroupReplayBuffer(max_query_groups=16, seed=42)
+    deltas = [0.2, 0.0, 0.1, 0.3]
+    for i, delta in enumerate(deltas, start=1):
+        buffer.append_group(_make_group(f"q{i}", delta=delta, insertion_step=i))
+
+    result_chunked = select_replay_groups(
+        buffer=buffer,
+        target_groups=2,
+        tau=0.2,
+        compute_new_log_probs_fn=_compute_new,
+        compute_new_log_probs_batch_fn=_compute_new_batch,
+        max_scan=len(buffer),
+        selection_mode="m2_only",
+        groups_per_chunk=4,
+    )
+
+    assert [g.query_id for g in result_chunked.selected_groups] == ["q2", "q3"]
+    assert result_chunked.accepted_m2 == pytest.approx([0.0, 0.01], rel=1e-6)

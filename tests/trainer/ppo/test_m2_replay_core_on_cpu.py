@@ -71,6 +71,28 @@ def test_select_replay_groups_tau_and_target():
     assert result.rejected_by_tau == 1
 
 
+def test_select_replay_groups_m2_only_prefers_smallest_m2_over_insertion_order():
+    buffer = QueryGroupReplayBuffer(max_query_groups=8, seed=123)
+    buffer.append_group(_make_group("q1", delta=0.2, success_prob=0.5, insertion_step=1))
+    buffer.append_group(_make_group("q2", delta=0.0, success_prob=0.5, insertion_step=2))
+    buffer.append_group(_make_group("q3", delta=0.1, success_prob=0.5, insertion_step=3))
+
+    def compute_new(data: DataProto) -> torch.Tensor:
+        return data.batch["old_log_probs"] + data.batch["delta"]
+
+    result = select_replay_groups(
+        buffer=buffer,
+        target_groups=2,
+        tau=0.2,
+        compute_new_log_probs_fn=compute_new,
+        max_scan=len(buffer),
+        selection_mode="m2_only",
+    )
+
+    assert [g.query_id for g in result.selected_groups] == ["q2", "q3"]
+    assert result.accepted_m2 == pytest.approx([0.0, 0.01], rel=1e-6)
+
+
 def test_derive_micro_group_multiple():
     assert derive_micro_group_multiple(micro_batch_size_per_gpu=8, n_gpus=8, rollout_n=8) == 8
     assert derive_micro_group_multiple(micro_batch_size_per_gpu=None, n_gpus=8, rollout_n=8) == 1
