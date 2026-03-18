@@ -187,6 +187,7 @@ class AgentData:
         self.user_turns = 0
         self.assistant_turns = 0
         self.tool_turns = 0
+        self.executed_tool_pair_count = 0
         self.termination_reason: Optional[str] = None
 
         # Temporary state for tool calls
@@ -194,6 +195,33 @@ class AgentData:
 
         # Extra fields for dynamic addition, e.g., tool session data
         self.extra_fields: dict[str, Any] = {}
+
+
+def _normalize_tool_execute_result(tool_execute_result: Any, agent_data: Optional[AgentData] = None) -> ToolResponse:
+    """Normalize tool.execute() outputs across tool implementations.
+
+    Tool implementations in this repo are inconsistent today:
+    - Some return `ToolResponse`
+    - Some return `(ToolResponse, tool_reward, tool_metrics)`
+
+    ToolAgentLoop needs a `ToolResponse` for prompt injection. If a reward is
+    present, record it in `turn_scores` so it is not silently dropped.
+    """
+    if isinstance(tool_execute_result, ToolResponse):
+        return tool_execute_result
+
+    if isinstance(tool_execute_result, tuple) and len(tool_execute_result) >= 1:
+        tool_response = tool_execute_result[0]
+        tool_reward = tool_execute_result[1] if len(tool_execute_result) >= 2 else None
+        if not isinstance(tool_response, ToolResponse):
+            raise TypeError(
+                f"tool.execute() returned tuple whose first element is not ToolResponse: {type(tool_response)}"
+            )
+        if agent_data is not None and tool_reward is not None:
+            agent_data.turn_scores.append(tool_reward)
+        return tool_response
+
+    raise TypeError(f"tool.execute() returned unsupported type: {type(tool_execute_result)}")
 
 
 @register("tool_agent")
@@ -335,7 +363,13 @@ class ToolAgentLoop(AgentLoopBase):
         )
         # propagate tool/session extra fields (e.g., image_paths) to reward computation
         output.extra_fields.update(agent_data.extra_fields)
-        output.extra_fields.update({"turn_scores": agent_data.turn_scores})
+        output.extra_fields.update(
+            {
+                "turn_scores": agent_data.turn_scores,
+                "tool_call_counts": agent_data.executed_tool_pair_count,
+                "tool_response_pair_counts": agent_data.executed_tool_pair_count,
+            }
+        )
 
         # Log trajectory at episode termination
         try:
@@ -464,6 +498,7 @@ class ToolAgentLoop(AgentLoopBase):
 
         with simple_timer("tool_calls", agent_data.metrics):
             responses = await asyncio.gather(*tasks)
+        agent_data.executed_tool_pair_count += len(responses)
 
         # Process tool responses and update multi_modal_data
         for tool_response in responses:
@@ -601,9 +636,10 @@ class ToolAgentLoop(AgentLoopBase):
             tool = self.tools[tool_name]
             kwargs = tools_kwargs.get(tool_name, {})
             instance_id, _ = await tool.create(create_kwargs=kwargs.get("create_kwargs", {}))
-            tool_execution_response = await tool.execute(
+            tool_execute_result = await tool.execute(
                 instance_id, tool_args, agent_data=agent_data
             )
+            tool_execution_response = _normalize_tool_execute_result(tool_execute_result, agent_data=agent_data)
         except Exception as e:
             logger.warning(f"Error when executing tool: {e}")
             return ToolResponse(text=f"Error when executing tool: {e}")

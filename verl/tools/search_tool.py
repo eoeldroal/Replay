@@ -105,9 +105,10 @@ def init_search_execution_pool(
 ):
     """Initialize search execution pool."""
     if mode == PoolMode.ThreadMode:
+        pool_name = f"search-execution-worker-{mode.name.lower()}-{num_workers}-{rate_limit}-{int(enable_global_rate_limit)}"
         return (
             ray.remote(SearchExecutionWorker)
-            .options(max_concurrency=num_workers)
+            .options(name=pool_name, get_if_exists=True, max_concurrency=num_workers)
             .remote(enable_global_rate_limit=enable_global_rate_limit, rate_limit=rate_limit)
         )
     else:
@@ -163,14 +164,10 @@ class SearchTool(BaseTool):
         self.num_workers = config.get("num_workers", 120)
         self.rate_limit = config.get("rate_limit", 120)
         self.timeout = config.get("timeout", 30)
+        self.use_ray_pool = config.get("use_ray_pool", True)
 
         self.enable_global_rate_limit = config.get("enable_global_rate_limit", True)
-        self.execution_pool = init_search_execution_pool(
-            num_workers=self.num_workers,
-            enable_global_rate_limit=self.enable_global_rate_limit,
-            rate_limit=self.rate_limit,
-            mode=PoolMode.ThreadMode,
-        )
+        self.execution_pool = None
 
         # Retrieval service configuration
         self.retrieval_service_url = config.get("retrieval_service_url")
@@ -180,6 +177,22 @@ class SearchTool(BaseTool):
             raise ValueError("retrieval_service_url is not set")
 
         logger.info(f"Initialized SearchTool with config: {config}")
+
+    def _get_execution_pool(self):
+        """Lazily initialize the Ray execution pool only when actually needed.
+
+        Search-R1 dataset/schema initialization may construct tool instances before any
+        real search call happens. Delaying pool creation avoids eager actor startup in
+        those code paths.
+        """
+        if self.execution_pool is None:
+            self.execution_pool = init_search_execution_pool(
+                num_workers=self.num_workers,
+                enable_global_rate_limit=self.enable_global_rate_limit,
+                rate_limit=self.rate_limit,
+                mode=PoolMode.ThreadMode,
+            )
+        return self.execution_pool
 
     def get_openai_tool_schema(self) -> OpenAIFunctionToolSchema:
         """Return the OpenAI tool schema."""
@@ -241,17 +254,37 @@ class SearchTool(BaseTool):
         """
         timeout = self.timeout
         query_list_from_params = parameters.get("query_list")
+        if (not query_list_from_params or not isinstance(query_list_from_params, list)) and isinstance(
+            parameters.get("query"), str
+        ):
+            normalized_query = parameters["query"].strip()
+            if normalized_query:
+                query_list_from_params = [normalized_query]
 
         if not query_list_from_params or not isinstance(query_list_from_params, list):
-            error_msg = "Error: 'query_list' is missing, empty, or not a list in parameters."
+            error_msg = "Error: expected either non-empty 'query_list' or string 'query' in parameters."
             logger.error(f"[SearchTool] {error_msg} Received parameters: {parameters}")
             return ToolResponse(text=json.dumps({"result": error_msg})), 0.0, {}
 
-        # Execute search using Ray execution pool
         try:
-            result_text, metadata = await self.execution_pool.execute.remote(
-                self.execute_search, instance_id, query_list_from_params, self.retrieval_service_url, self.topk, timeout
-            )
+            if self.use_ray_pool:
+                execution_pool = self._get_execution_pool()
+                result_text, metadata = await execution_pool.execute.remote(
+                    self.execute_search,
+                    instance_id,
+                    query_list_from_params,
+                    self.retrieval_service_url,
+                    self.topk,
+                    timeout,
+                )
+            else:
+                result_text, metadata = self.execute_search(
+                    instance_id,
+                    query_list_from_params,
+                    self.retrieval_service_url,
+                    self.topk,
+                    timeout,
+                )
 
             # Store results in instance dictionary
             self._instance_dict[instance_id]["reward"].append(result_text.strip())
@@ -277,3 +310,4 @@ class SearchTool(BaseTool):
     async def release(self, instance_id: str, **kwargs) -> None:
         if instance_id in self._instance_dict:
             del self._instance_dict[instance_id]
+            
