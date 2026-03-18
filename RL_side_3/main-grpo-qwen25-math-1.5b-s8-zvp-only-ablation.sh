@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 project_name=m2-replay-exp
-experiment_name=main-grpo-qwen25-math-1.5b-s8-m2-replay-tau0025-b1024-ndeg-plain-quarter
+experiment_name=main-grpo-qwen25-math-1.5b-s8-zvp-only-ablation-b1024-ndeg-quarter
 start_mode=quarter
 
 deepscaler_preview_train_path="$ROOT_DIR/data/deepscaler_preview/train.parquet"
@@ -68,7 +68,7 @@ python3 -u -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
     algorithm.use_kl_in_reward=False \
     +algorithm.m2_replay.enable=true \
-    +algorithm.m2_replay.tau=0.001 \
+    +algorithm.m2_replay.tau=999999 \
     +algorithm.m2_replay.buffer.max_query_groups=1024 \
     +algorithm.m2_replay.schedule.replay_target_groups=128 \
     +algorithm.m2_replay.schedule.start_mode=${start_mode} \
