@@ -111,6 +111,20 @@ data/**
 !data/VDR_processed_filtered_2/
 !data/VDR_processed_filtered_2/filters/
 !data/VDR_processed_filtered_2/filters/**
+!data/deepscaler_preview/
+!data/deepscaler_preview/train.parquet
+!data/math500/
+!data/math500/test.parquet
+!data/aime2024x4/
+!data/aime2024x4/test.parquet
+!data/aime2025x4/
+!data/aime2025x4/test.parquet
+!data/minerva/
+!data/minerva/test.parquet
+!data/amc23/
+!data/amc23/test.parquet
+!data/olympiadbench/
+!data/olympiadbench/test.parquet
 
 nohup.out
 *.pre_restore_backup
